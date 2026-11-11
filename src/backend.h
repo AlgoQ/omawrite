@@ -38,6 +38,11 @@ class Backend : public QObject {
     Q_PROPERTY(QString themeSelectionForeground READ themeSelectionForeground NOTIFY themeColorsChanged)
     Q_PROPERTY(QString editorFont READ editorFont WRITE setEditorFont NOTIFY editorFontChanged)
     Q_PROPERTY(QStringList availableFonts READ availableFonts CONSTANT)
+    // The note's YAML frontmatter as Obsidian shows it: rows of keyed values,
+    // tags and up: links included. The raw block is kept out of the editor and
+    // joined back on save.
+    Q_PROPERTY(bool hasProperties READ hasProperties NOTIFY propertiesChanged)
+    Q_PROPERTY(QVariantList documentProperties READ documentProperties NOTIFY propertiesChanged)
     Q_PROPERTY(double scrollSpeed READ scrollSpeed WRITE setScrollSpeed NOTIFY scrollSpeedChanged)
     // The file viewer's source: "links" follows the notes' up: links like
     // Obsidian's VirtFolder, "folders" shows the folders on disk.
@@ -137,10 +142,20 @@ public:
     Q_INVOKABLE void openImage(const QUrl &url);
     Q_INVOKABLE void setImageAreaWidth(int width);
     Q_INVOKABLE QVariantMap emphasisSpanAt(int position, const QString &marker) const;
+    // Properties editing. Each rewrite touches only the named key's lines and
+    // keeps the rest of the frontmatter, comments and order included.
+    Q_INVOKABLE bool addTag(const QString &tag);
+    Q_INVOKABLE bool removeTag(const QString &tag);
+    Q_INVOKABLE bool removePropertyValue(const QString &key, const QString &value);
+    Q_INVOKABLE bool setPropertyValue(const QString &key, const QString &value);
+    Q_INVOKABLE bool addProperty(const QString &key, const QString &value);
+    Q_INVOKABLE bool removeProperty(const QString &key);
     // Rebindable keys. shortcutSequences falls back to the built-in defaults
     // until setShortcut stores an override; resetShortcut drops it again.
     // shortcutRows feeds the settings and shortcuts dialogs: one map per
     // action with its id, description, and sequences joined for display.
+    bool hasProperties() const { return !m_frontmatter.isEmpty(); }
+    QVariantList documentProperties() const;
     Q_INVOKABLE QStringList shortcutIds() const;
     Q_INVOKABLE QString shortcutDescription(const QString &id) const;
     Q_INVOKABLE QStringList shortcutSequences(const QString &id) const;
@@ -177,6 +192,7 @@ signals:
     void saveSucceeded();
     void externalChangeDetected(bool deleted, bool locallyModified);
     void scrollSpeedChanged();
+    void propertiesChanged();
     void treeModeChanged();
     void shortcutsChanged();
 
@@ -184,6 +200,8 @@ private:
     friend class OmawriteTest;
 
     void loadDocumentText(const QString &text);
+    QString fullDocumentText() const;
+    void frontmatterEdited();
     void applyHangingIndents(bool clearUndo);
     QString notesRoot() const;
     QUrl resolveNote(const QString &target) const;
@@ -265,6 +283,9 @@ private:
     QPointer<MarkdownHighlighter> m_highlighter;
     int m_caretPosition = 0;
     QString m_lastDocumentText;
+    // The note's YAML frontmatter, fences included, kept out of the editor so
+    // properties can be drawn in its place; currentDocumentText() is the body.
+    QString m_frontmatter;
     QByteArray m_lastKnownFileContents;
     QString m_lastKnownFileText;
     bool m_hasKnownFileContents = false;

@@ -4566,6 +4566,278 @@ private slots:
         QCOMPARE(total, 2);
     }
 
+    void hidesFrontmatterFromTheEditorButSavesIt() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Branding.md"),
+                      "---\ntags:\n  - atomic\n---\n# Branding\n\nBody\n"));
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Branding.md"))));
+        // The editor holds the body only, so the properties panel can take
+        // the YAML's place without the document ever losing it.
+        QCOMPARE(document->textDocument()->toPlainText(),
+                 QStringLiteral("# Branding\n\nBody\n"));
+        QVERIFY(backend.hasProperties());
+        const QVariantList rows = backend.documentProperties();
+        QCOMPARE(rows.size(), 1);
+        QCOMPARE(rows.constFirst().toMap().value(QStringLiteral("key")).toString(),
+                 QStringLiteral("tags"));
+        QCOMPARE(rows.constFirst().toMap().value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("tags"));
+        QCOMPARE(rows.constFirst().toMap().value(QStringLiteral("values")).toStringList(),
+                 (QStringList{QStringLiteral("atomic")}));
+
+        QVERIFY(backend.addTag(QStringLiteral("fleeting")));
+        QVERIFY(backend.removeTag(QStringLiteral("atomic")));
+        backend.save();
+
+        const QByteArray saved = readFile(root.filePath(QStringLiteral("Branding.md")));
+        QVERIFY(saved.startsWith("---\ntags:\n"));
+        QVERIFY(saved.contains("  - fleeting"));
+        QVERIFY(!saved.contains("atomic"));
+        QVERIFY(saved.endsWith("# Branding\n\nBody\n"));
+    }
+
+    void editsPropertiesWithoutLosingOtherFrontmatter() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Note.md"),
+                      "---\n# keep this comment\ntags:\n  - atomic\nrating: 3\n---\n"
+                      "# Note\n"));
+        QVERIFY(write(QStringLiteral("Plain.md"), "# Plain\n"));
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Note.md"))));
+        QVERIFY(backend.addTag(QStringLiteral("fleeting")));
+        backend.save();
+        QByteArray saved = readFile(root.filePath(QStringLiteral("Note.md")));
+        QVERIFY(saved.contains("# keep this comment"));
+        QVERIFY(saved.contains("rating: 3"));
+        QVERIFY(saved.contains("  - fleeting"));
+
+        // A note with no frontmatter grows one from + Add property, and the
+        // body is untouched.
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Plain.md"))));
+        QVERIFY(!backend.hasProperties());
+        QVERIFY(backend.addProperty(QStringLiteral("status"), QStringLiteral("draft")));
+        QVERIFY(backend.hasProperties());
+        QCOMPARE(backend.currentDocumentText(), QStringLiteral("# Plain\n"));
+        QVERIFY(backend.setPropertyValue(QStringLiteral("status"), QStringLiteral("final")));
+        backend.save();
+        saved = readFile(root.filePath(QStringLiteral("Plain.md")));
+        QCOMPARE(saved, QByteArray("---\nstatus: final\n---\n# Plain\n"));
+
+        QVERIFY(backend.addProperty(QStringLiteral("up"), QStringLiteral("Parent, Other")));
+        const QVariantList rows = backend.documentProperties();
+        QCOMPARE(rows.size(), 2);
+        QCOMPARE(rows.at(1).toMap().value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("links"));
+        QCOMPARE(rows.at(1).toMap().value(QStringLiteral("values")).toStringList(),
+                 (QStringList{QStringLiteral("Parent"), QStringLiteral("Other")}));
+        QVERIFY(backend.removeProperty(QStringLiteral("up")));
+        QVERIFY(backend.removeProperty(QStringLiteral("status")));
+        QVERIFY(!backend.hasProperties());
+    }
+
+    void showsPropertiesInlineAboveTheText() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QFile file(root.filePath(QStringLiteral("Note.md")));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("---\ntags:\n  - atomic\n---\n# Note\n");
+        file.close();
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Note.md"))));
+
+        QObject *panel = window->findChild<QObject *>(QStringLiteral("propertiesPanel"));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(panel);
+        QVERIFY(editor);
+        QTRY_VERIFY(panel->property("visible").toBool());
+        QVERIFY(panel->property("height").toReal() > 0);
+        QCOMPARE(editor->property("text").toString(), QStringLiteral("# Note\n"));
+        // The text starts below the properties, not underneath them.
+        QVERIFY(editor->property("y").toReal()
+                >= panel->property("y").toReal() + panel->property("height").toReal());
+    }
+
+    void showsPropertiesAndKeepsYamlOutOfTheEditor() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const QString notePath = root.filePath(QStringLiteral("Tagged.md"));
+        {
+            QFile file(notePath);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("---\ntags:\n  - atomic\nup:\n  - \"[[Branding]]\"\n---\nBody text\n");
+        }
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(notePath));
+
+        // The YAML is the panel's model, never part of the writing.
+        QCOMPARE(document->textDocument()->toPlainText(), QStringLiteral("Body text\n"));
+        QVERIFY(backend.hasProperties());
+        const QVariantList rows = backend.documentProperties();
+        QCOMPARE(rows.size(), 2);
+        QCOMPARE(rows.at(0).toMap().value(QStringLiteral("key")).toString(),
+                 QStringLiteral("tags"));
+        QCOMPARE(rows.at(0).toMap().value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("tags"));
+        QCOMPARE(rows.at(0).toMap().value(QStringLiteral("values")).toStringList(),
+                 (QStringList{QStringLiteral("atomic")}));
+        QCOMPARE(rows.at(1).toMap().value(QStringLiteral("key")).toString(),
+                 QStringLiteral("up"));
+        QCOMPARE(rows.at(1).toMap().value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("links"));
+        QCOMPARE(rows.at(1).toMap().value(QStringLiteral("values")).toStringList(),
+                 (QStringList{QStringLiteral("Branding")}));
+
+        // A tag edit rewrites only the tags key and re-saves the whole note.
+        QVERIFY(backend.addTag(QStringLiteral("fleeting")));
+        QVERIFY(backend.removeTag(QStringLiteral("atomic")));
+        QVERIFY(backend.modified());
+        QVERIFY(backend.setPropertyValue(QStringLiteral("status"), QStringLiteral("draft")));
+        backend.save();
+
+        QFile saved(notePath);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(saved.readAll());
+        QVERIFY(text.startsWith(QStringLiteral("---\n")));
+        QVERIFY(text.contains(QStringLiteral("  - fleeting")));
+        QVERIFY(!text.contains(QStringLiteral("  - atomic")));
+        QVERIFY(text.contains(QStringLiteral("status: draft")));
+        QVERIFY(text.contains(QStringLiteral("  - \"[[Branding]]\"")));
+        QVERIFY(text.endsWith(QStringLiteral("---\nBody text\n")));
+        QCOMPARE(document->textDocument()->toPlainText(), QStringLiteral("Body text\n"));
+    }
+
+    void addsFrontmatterToANoteThatHadNone() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const QString notePath = root.filePath(QStringLiteral("Plain.md"));
+        {
+            QFile file(notePath);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("# Plain\n");
+        }
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(notePath));
+        QVERIFY(!backend.hasProperties());
+
+        QVERIFY(backend.addTag(QStringLiteral("atomic")));
+        QVERIFY(backend.hasProperties());
+        QVERIFY(backend.addProperty(QStringLiteral("status"), QStringLiteral("draft")));
+        backend.save();
+
+        QFile saved(notePath);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(saved.readAll());
+        QVERIFY(text.startsWith(QStringLiteral("---\ntags:\n  - atomic\nstatus: draft\n---\n")));
+        QVERIFY(text.endsWith(QStringLiteral("# Plain\n")));
+        QCOMPARE(document->textDocument()->toPlainText(), QStringLiteral("# Plain\n"));
+    }
+
+    void removesPropertiesAndTheirLastValue() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const QString notePath = root.filePath(QStringLiteral("Props.md"));
+        {
+            QFile file(notePath);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("---\ntags:\n  - one\n  - two\nstatus: draft\n---\nbody\n");
+        }
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(notePath));
+
+        QVERIFY(backend.removePropertyValue(QStringLiteral("tags"), QStringLiteral("one")));
+        QCOMPARE(backend.documentProperties().at(0).toMap()
+                     .value(QStringLiteral("values")).toStringList(),
+                 (QStringList{QStringLiteral("two")}));
+        QVERIFY(backend.removeTag(QStringLiteral("two")));
+        QVERIFY(backend.removeProperty(QStringLiteral("status")));
+        QVERIFY(!backend.hasProperties());
+
+        backend.save();
+        QFile saved(notePath);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        QCOMPARE(QString::fromUtf8(saved.readAll()), QStringLiteral("body\n"));
+    }
+
+    void editsAListPropertyWithoutFlatteningIt() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const QString notePath = root.filePath(QStringLiteral("List.md"));
+        {
+            QFile file(notePath);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("---\naliases:\n  - One\n  - Two\n---\nbody\n");
+        }
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+        backend.open(QUrl::fromLocalFile(notePath));
+        QCOMPARE(backend.documentProperties().at(0).toMap()
+                     .value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("list"));
+
+        // Editing the row as text keeps the block a YAML list.
+        QVERIFY(backend.setPropertyValue(QStringLiteral("aliases"),
+                                         QStringLiteral("One, Three")));
+        backend.save();
+
+        QFile saved(notePath);
+        QVERIFY(saved.open(QIODevice::ReadOnly));
+        QCOMPARE(QString::fromUtf8(saved.readAll()),
+                 QStringLiteral("---\naliases:\n  - One\n  - Three\n---\nbody\n"));
+    }
+
     void shortcutDefaultsCanBeOverriddenAndReset() {
         Backend backend;
         QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),

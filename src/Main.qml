@@ -337,6 +337,9 @@ ApplicationWindow {
     function toggleSidebar() {
         sidebarOpen = !sidebarOpen;
         if (sidebarOpen) {
+            // A note may have been filed, renamed, or re-parented since the
+            // tree last looked, so reread the vault before showing it.
+            backend.refreshNoteIndex();
             revealCurrentInTree();
             rebuildTree();
             Qt.callLater(function() { sidebarList.forceActiveFocus(); });
@@ -888,6 +891,11 @@ ApplicationWindow {
         }
 
         function onSaveSucceeded() {
+            // A save can change a note's up: or tags, which the link tree
+            // draws from the index rather than from disk on each rebuild.
+            backend.refreshNoteIndex();
+            if (win.sidebarOpen)
+                win.rebuildTree();
             // Only a save the writer chose in the prompt carries out the
             // pending close or open, never an auto-save that lands meanwhile.
             const confirmed = win.awaitingPendingSave;
@@ -1366,8 +1374,14 @@ ApplicationWindow {
                 contentY = snapToPixel(y);
             }
 
+            // The writing column's resting top, with the properties panel, if
+            // any, sitting above the text at this line.
+            readonly property int textTop:
+                Math.max(0, Math.max(42, Math.round(win.height * 0.05)) - win.footerHeight)
+
             // Keep the editing caret within the viewport so writing past the
             // bottom edge scrolls the page along with the text.
+
             function ensureCursorVisible() {
                 var margin = win.editorFontPixelSize * 2;
                 var cursorTop = editor.y + editor.cursorRectangle.y;
@@ -1380,13 +1394,361 @@ ApplicationWindow {
                     scrollTo(Math.max(0, cursorTop - margin));
             }
 
+            // Inline properties, Obsidian-style: the note's frontmatter drawn
+            // as rows of values at the top of the page. Tags and up: links are
+            // chips; other values edit in place; the raw YAML never reaches
+            // the editor, and Backend joins it back on save.
+            Item {
+                id: propertiesPanel
+                objectName: "propertiesPanel"
+                visible: backend.hasProperties
+                x: Math.round((editorFlick.width - width) / 2)
+                y: editorFlick.textTop
+                width: win.editorWidth
+                height: propertiesColumn.height
+                property bool collapsed: false
+                property bool addingProperty: false
+
+                Column {
+                    id: propertiesColumn
+                    width: parent.width
+                    height: childrenRect.height
+                    spacing: win.scaledSize(4)
+
+                    Row {
+                        spacing: win.scaledSize(8)
+                        height: win.scaledSize(28)
+
+                        Text {
+                            text: "Properties"
+                            color: win.textColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(15)
+                            font.bold: true
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        Text {
+                            text: propertiesPanel.collapsed ? "›" : "⌄"
+                            color: win.mutedColor
+                            font.pixelSize: win.scaledSize(15)
+                            anchors.verticalCenter: parent.verticalCenter
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -8
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: propertiesPanel.collapsed = !propertiesPanel.collapsed
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        model: backend.documentProperties
+
+                        Item {
+                            id: propertyRow
+                            width: propertiesColumn.width
+                            height: Math.max(win.scaledSize(26), valueFlow.height)
+                            visible: !propertiesPanel.collapsed
+
+                            property var entry: modelData
+                            property bool editing: false
+                            property bool editingTag: false
+
+                            readonly property bool isTags:
+                                entry.kind === "tags"
+                            readonly property bool isLinks:
+                                entry.kind === "links"
+
+                            Text {
+                                id: keyLabel
+                                width: Math.min(win.scaledSize(150), propertyRow.width * 0.3)
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: propertyRow.entry.key
+                                color: win.mutedColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(13)
+                                elide: Text.ElideRight
+                            }
+
+                            Flow {
+                                id: valueFlow
+                                x: keyLabel.width + win.scaledSize(12)
+                                width: propertyRow.width - x - win.scaledSize(28)
+                                height: childrenRect.height
+                                spacing: win.scaledSize(6)
+                                anchors.verticalCenter: parent.verticalCenter
+
+                                Repeater {
+                                    model: propertyRow.isTags || propertyRow.isLinks
+                                           ? propertyRow.entry.values : []
+
+                                    Rectangle {
+                                        width: chipRow.width + win.scaledSize(16)
+                                        height: win.scaledSize(24)
+                                        radius: win.scaledSize(9)
+                                        color: win.darkMode ? "#2e2e28" : "#ece9da"
+                                        border.color: win.darkMode ? "#474740" : "#d8d4c2"
+                                        border.width: 1
+
+                                        Row {
+                                            id: chipRow
+                                            anchors.centerIn: parent
+                                            spacing: win.scaledSize(6)
+
+                                            Text {
+                                                text: modelData
+                                                color: win.textColor
+                                                font.family: backend.editorFont
+                                                font.pixelSize: win.scaledSize(12)
+                                            }
+
+                                            Text {
+                                                visible: propertyRow.isTags || propertyRow.isLinks
+                                                text: "×"
+                                                color: win.mutedColor
+                                                font.pixelSize: win.scaledSize(12)
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    anchors.margins: -6
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: {
+                                                        if (propertyRow.isTags)
+                                                            backend.removeTag(modelData);
+                                                        else
+                                                            backend.removePropertyValue("up", modelData);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    visible: propertyRow.isTags && !propertyRow.editingTag
+                                    text: "+"
+                                    color: win.mutedColor
+                                    font.pixelSize: win.scaledSize(16)
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        anchors.margins: -8
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            propertyRow.editingTag = true;
+                                            Qt.callLater(function() { tagField.forceActiveFocus(); });
+                                        }
+                                    }
+                                }
+
+                                TextField {
+                                    id: tagField
+                                    visible: propertyRow.editingTag
+                                    width: win.scaledSize(110)
+                                    height: win.scaledSize(24)
+                                    color: win.textColor
+                                    selectionColor: win.selectionFill
+                                    selectedTextColor: win.selectionTextColor
+                                    font.family: backend.editorFont
+                                    font.pixelSize: win.scaledSize(12)
+                                    leftPadding: win.scaledSize(6)
+                                    rightPadding: win.scaledSize(6)
+                                    topPadding: 0
+                                    bottomPadding: 0
+                                    background: Rectangle {
+                                        color: win.pageColor
+                                        border.color: win.mutedColor
+                                        border.width: 1
+                                        radius: win.scaledSize(6)
+                                    }
+                                    onAccepted: {
+                                        if (backend.addTag(text))
+                                            text = "";
+                                        propertyRow.editingTag = false;
+                                    }
+                                    Keys.onEscapePressed: {
+                                        propertyRow.editingTag = false;
+                                        event.accepted = true;
+                                    }
+                                }
+
+                                Text {
+                                    visible: !propertyRow.isTags && !propertyRow.isLinks
+                                             && !propertyRow.editing
+                                    text: propertyRow.entry.display.length > 0
+                                          ? propertyRow.entry.display : "—"
+                                    color: propertyRow.entry.display.length > 0
+                                           ? win.textColor : win.mutedColor
+                                    font.family: backend.editorFont
+                                    font.pixelSize: win.scaledSize(13)
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        anchors.margins: -4
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            if (propertyRow.entry.kind === "checkbox") {
+                                                backend.setPropertyValue(
+                                                    propertyRow.entry.key,
+                                                    propertyRow.entry.display === "true"
+                                                        ? "false" : "true");
+                                                return;
+                                            }
+                                            propertyRow.editing = true;
+                                            Qt.callLater(function() { valueField.forceActiveFocus(); });
+                                        }
+                                    }
+                                }
+
+                                TextField {
+                                    id: valueField
+                                    visible: propertyRow.editing
+                                    width: Math.max(win.scaledSize(120),
+                                                   valueFlow.width - win.scaledSize(8))
+                                    height: win.scaledSize(24)
+                                    text: propertyRow.entry.display
+                                    color: win.textColor
+                                    selectionColor: win.selectionFill
+                                    selectedTextColor: win.selectionTextColor
+                                    font.family: backend.editorFont
+                                    font.pixelSize: win.scaledSize(13)
+                                    leftPadding: win.scaledSize(6)
+                                    rightPadding: win.scaledSize(6)
+                                    topPadding: 0
+                                    bottomPadding: 0
+                                    background: Rectangle {
+                                        color: win.pageColor
+                                        border.color: win.mutedColor
+                                        border.width: 1
+                                        radius: win.scaledSize(6)
+                                    }
+                                    onAccepted: {
+                                        backend.setPropertyValue(propertyRow.entry.key, text);
+                                        propertyRow.editing = false;
+                                    }
+                                    Keys.onEscapePressed: {
+                                        propertyRow.editing = false;
+                                        event.accepted = true;
+                                    }
+                                }
+                            }
+
+                            Text {
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "−"
+                                color: win.mutedColor
+                                opacity: 0.45
+                                font.pixelSize: win.scaledSize(14)
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -6
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: backend.removeProperty(propertyRow.entry.key)
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        visible: !propertiesPanel.collapsed && !propertiesPanel.addingProperty
+                        spacing: win.scaledSize(8)
+                        height: win.scaledSize(24)
+
+                        Text {
+                            text: "+ Add property"
+                            color: win.mutedColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(13)
+                            anchors.verticalCenter: parent.verticalCenter
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -6
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    propertiesPanel.addingProperty = true;
+                                    Qt.callLater(function() { propertyKeyField.forceActiveFocus(); });
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        visible: !propertiesPanel.collapsed && propertiesPanel.addingProperty
+                        spacing: win.scaledSize(6)
+                        height: win.scaledSize(26)
+
+                        TextField {
+                            id: propertyKeyField
+                            width: win.scaledSize(120)
+                            height: win.scaledSize(24)
+                            placeholderText: "property"
+                            placeholderTextColor: win.mutedColor
+                            color: win.textColor
+                            selectionColor: win.selectionFill
+                            selectedTextColor: win.selectionTextColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(12)
+                            leftPadding: win.scaledSize(6)
+                            rightPadding: win.scaledSize(6)
+                            topPadding: 0
+                            bottomPadding: 0
+                            background: Rectangle {
+                                color: win.pageColor
+                                border.color: win.mutedColor
+                                border.width: 1
+                                radius: win.scaledSize(6)
+                            }
+                            onAccepted: propertyValueField.forceActiveFocus()
+                        }
+
+                        TextField {
+                            id: propertyValueField
+                            width: win.scaledSize(220)
+                            height: win.scaledSize(24)
+                            placeholderText: "value"
+                            placeholderTextColor: win.mutedColor
+                            color: win.textColor
+                            selectionColor: win.selectionFill
+                            selectedTextColor: win.selectionTextColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(12)
+                            leftPadding: win.scaledSize(6)
+                            rightPadding: win.scaledSize(6)
+                            topPadding: 0
+                            bottomPadding: 0
+                            background: Rectangle {
+                                color: win.pageColor
+                                border.color: win.mutedColor
+                                border.width: 1
+                                radius: win.scaledSize(6)
+                            }
+                            onAccepted: {
+                                if (backend.addProperty(propertyKeyField.text, text)) {
+                                    propertyKeyField.text = "";
+                                    text = "";
+                                    propertiesPanel.addingProperty = false;
+                                }
+                            }
+                            Keys.onEscapePressed: {
+                                propertiesPanel.addingProperty = false;
+                                event.accepted = true;
+                            }
+                        }
+                    }
+
+                    Item { width: 1; height: win.scaledSize(10); visible: !propertiesPanel.collapsed }
+                }
+            }
+
             TextEdit {
                 id: editor
                 objectName: "sourceEditor"
                 x: Math.round((editorFlick.width - width) / 2)
                 // The resting position counts from the window's top edge, so
-                // take back the top inset the Flickable already adds.
-                y: Math.max(0, Math.max(42, Math.round(win.height * 0.05)) - win.footerHeight)
+                // take back the top inset the Flickable already adds. The
+                // properties panel, when present, sits above the text.
+                y: editorFlick.textTop
+                   + (propertiesPanel.visible
+                      ? propertiesPanel.height + win.scaledSize(26) : 0)
                 width: win.editorWidth
                 height: Math.max(editorFlick.height - y - 96, implicitHeight + 20)
                 text: ""

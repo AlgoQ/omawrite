@@ -211,6 +211,173 @@ QColor blend(const QColor &from, const QColor &to, qreal amount) {
 
 }
 
+namespace {
+
+// One top-level frontmatter key and the lines it owns. firstLine and lastLine
+// index the fenced block's own lines (the opening "---" is line 0), so a
+// rewrite can splice just this key and leave comments, order, and unknown
+// keys untouched.
+struct FrontmatterEntry {
+    QString key;
+    QStringList values;
+    bool isList = false;
+    bool isMapping = false;
+    int firstLine = -1;
+    int lastLine = -1;
+};
+
+QString unquoteYaml(QString value) {
+    value = value.trimmed();
+    if (value.size() >= 2
+            && ((value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"')))
+                || (value.startsWith(QLatin1Char('\'')) && value.endsWith(QLatin1Char('\''))))) {
+        value = value.mid(1, value.size() - 2);
+        value.replace(QStringLiteral("\\\""), QStringLiteral("\""));
+        value.replace(QStringLiteral("\\\\"), QStringLiteral("\\"));
+    }
+    return value;
+}
+
+// A tag's or link's displayed form: no leading #, no [[ ]], alias, or heading.
+QString cleanMetadataValue(QString value, bool link) {
+    value = unquoteYaml(value);
+    if (link) {
+        if (value.startsWith(QStringLiteral("[["))) {
+            const int close = value.indexOf(QStringLiteral("]]"));
+            if (close > 2)
+                value = value.mid(2, close - 2);
+        }
+        const int alias = value.indexOf(QLatin1Char('|'));
+        if (alias >= 0)
+            value.truncate(alias);
+        const int heading = value.indexOf(QLatin1Char('#'));
+        if (heading >= 0)
+            value.truncate(heading);
+    } else if (value.startsWith(QLatin1Char('#'))) {
+        value.remove(0, 1);
+    }
+    return value.trimmed();
+}
+
+QStringList frontmatterLines(const QString &frontmatter) {
+    QString text = frontmatter;
+    if (text.endsWith(QLatin1Char('\n')))
+        text.chop(1);
+    return text.isEmpty() ? QStringList() : text.split(QLatin1Char('\n'));
+}
+
+int frontmatterClose(const QStringList &lines) {
+    for (int i = 1; i < lines.size(); ++i) {
+        const QString line = lines.at(i).trimmed();
+        if (line == QStringLiteral("---") || line == QStringLiteral("..."))
+            return i;
+    }
+    return -1;
+}
+
+QList<FrontmatterEntry> parseFrontmatter(const QString &frontmatter) {
+    QList<FrontmatterEntry> entries;
+    if (!frontmatter.startsWith(QStringLiteral("---")))
+        return entries;
+    const QStringList lines = frontmatterLines(frontmatter);
+    const int close = frontmatterClose(lines);
+    if (close < 0)
+        return entries;
+
+    for (int i = 1; i < close;) {
+        const QString line = lines.at(i);
+        const bool nested = line.startsWith(QLatin1Char(' ')) || line.startsWith(QLatin1Char('\t'));
+        const int colon = line.indexOf(QLatin1Char(':'));
+        if (line.trimmed().isEmpty() || nested || line.startsWith(QLatin1Char('#')) || colon <= 0) {
+            ++i;
+            continue;
+        }
+        FrontmatterEntry entry;
+        entry.key = line.left(colon).trimmed();
+        entry.firstLine = i;
+        const QString rest = line.mid(colon + 1).trimmed();
+        if (rest.startsWith(QLatin1Char('{'))) {
+            // A mapping value (some vaults put one under up:). Shown but not
+            // edited: rewriting it would drop fields this editor cannot see.
+            entry.isMapping = true;
+            entry.lastLine = i;
+            entries.append(entry);
+            ++i;
+            continue;
+        }
+        if (rest.startsWith(QLatin1Char('['))) {
+            entry.isList = true;
+            QString flow = rest.mid(1);
+            if (flow.endsWith(QLatin1Char(']')))
+                flow.chop(1);
+            for (const QString &part : flow.split(QLatin1Char(','))) {
+                if (!part.trimmed().isEmpty())
+                    entry.values.append(unquoteYaml(part));
+            }
+            entry.lastLine = i;
+            entries.append(entry);
+            ++i;
+            continue;
+        }
+        if (rest.isEmpty()) {
+            entry.isList = true;
+            int j = i + 1;
+            while (j < close) {
+                const QString item = lines.at(j).trimmed();
+                if (!item.startsWith(QLatin1Char('-')))
+                    break;
+                const QString value = unquoteYaml(item.mid(1));
+                if (!value.isEmpty())
+                    entry.values.append(value);
+                ++j;
+            }
+            entry.lastLine = j - 1;
+            entries.append(entry);
+            i = j;
+            continue;
+        }
+        entry.values = {unquoteYaml(rest)};
+        entry.lastLine = i;
+        entries.append(entry);
+        ++i;
+    }
+    return entries;
+}
+
+QString yamlScalar(const QString &value) {
+    const QString trimmed = value.trimmed();
+    const bool needsQuotes = trimmed.isEmpty() || trimmed != value
+        || trimmed.contains(QLatin1Char(':')) || trimmed.contains(QLatin1Char('#'))
+        || trimmed.contains(QLatin1Char('[')) || trimmed.contains(QLatin1Char(']'))
+        || trimmed.contains(QLatin1Char('{')) || trimmed.contains(QLatin1Char('}'))
+        || trimmed.contains(QLatin1Char(',')) || trimmed.contains(QLatin1Char('"'))
+        || trimmed.contains(QLatin1Char('\n'))
+        || trimmed.startsWith(QLatin1Char('-')) || trimmed.startsWith(QLatin1Char('&'))
+        || trimmed.startsWith(QLatin1Char('*')) || trimmed.startsWith(QLatin1Char('!'))
+        || trimmed.startsWith(QLatin1Char('|')) || trimmed.startsWith(QLatin1Char('>'));
+    if (!needsQuotes)
+        return trimmed;
+    QString escaped = trimmed;
+    escaped.replace(QStringLiteral("\\"), QStringLiteral("\\\\"));
+    escaped.replace(QStringLiteral("\""), QStringLiteral("\\\""));
+    return QLatin1Char('"') + escaped + QLatin1Char('"');
+}
+
+QString composeFrontmatter(const QStringList &lines) {
+    if (lines.isEmpty())
+        return {};
+    // lines already carries the two fence lines.
+    return lines.join(QLatin1Char('\n')) + QLatin1Char('\n');
+}
+
+// True when the frontmatter list held nothing but its two fences.
+bool frontmatterIsEmpty(const QStringList &lines) {
+    const int close = frontmatterClose(lines);
+    return close < 0 || close == 1;
+}
+
+} // namespace
+
 QString Backend::normalizedLinkUrl(const QString &clipboardText) {
     QString candidate = clipboardText.trimmed();
     static const QRegularExpression lineBreakRe(QStringLiteral("[\\r\\n]"));
@@ -793,6 +960,7 @@ bool Backend::editorTextChanged() {
 
     scheduleWordCount();
 
+    const QString full = fullDocumentText();
     const QString &baseline = m_lastKnownFileText;
     // An empty baseline means a pristine untitled document, but only when there
     // is no file behind it. Once there is one, an unknown baseline is unknown
@@ -800,7 +968,7 @@ bool Backend::editorTextChanged() {
     const bool baselineKnown = m_hasKnownFileContents
         || !m_fileUrl.isValid() || m_fileUrl.isEmpty();
 
-    if (baselineKnown && text == baseline) {
+    if (baselineKnown && full == baseline) {
         setModified(false);
         clearRecovery();
         if (m_hasKnownFileContents)
@@ -1152,6 +1320,333 @@ Backend::NoteMeta Backend::readNoteFrontmatter(const QString &absolutePath) {
         ++i;
     }
     return meta;
+}
+
+QString Backend::fullDocumentText() const {
+    return m_frontmatter + currentDocumentText();
+}
+
+// What the properties panel draws: one row per top-level key, in file order,
+// with tags and up: links resolved to their readable targets.
+QVariantList Backend::documentProperties() const {
+    QVariantList rows;
+    for (const FrontmatterEntry &entry : parseFrontmatter(m_frontmatter)) {
+        if (entry.isMapping)
+            continue;
+
+        QString kind = QStringLiteral("text");
+        QStringList values = entry.values;
+        if (entry.key == QStringLiteral("tags") || entry.key == QStringLiteral("tag")) {
+            kind = QStringLiteral("tags");
+            for (QString &value : values)
+                value = cleanMetadataValue(value, false);
+        } else if (entry.key == QStringLiteral("up")) {
+            kind = QStringLiteral("links");
+            for (QString &value : values)
+                value = cleanMetadataValue(value, true);
+        } else if (entry.isList) {
+            kind = QStringLiteral("list");
+            for (QString &value : values)
+                value = cleanMetadataValue(value, false);
+        } else if (values.size() == 1
+                   && (values.constFirst() == QStringLiteral("true")
+                       || values.constFirst() == QStringLiteral("false"))) {
+            kind = QStringLiteral("checkbox");
+        } else if (values.size() == 1) {
+            bool number = false;
+            values.constFirst().toDouble(&number);
+            static const QRegularExpression dateRe(
+                QStringLiteral("^\\d{4}-\\d{2}-\\d{2}$"));
+            if (number)
+                kind = QStringLiteral("number");
+            else if (dateRe.match(values.constFirst()).hasMatch())
+                kind = QStringLiteral("date");
+        }
+
+        QString display = values.join(QStringLiteral(", "));
+        if (kind == QStringLiteral("checkbox"))
+            display = values.constFirst();
+        rows.append(QVariantMap{
+            {QStringLiteral("key"), entry.key},
+            {QStringLiteral("kind"), kind},
+            {QStringLiteral("values"), values},
+            {QStringLiteral("display"), display}});
+    }
+    return rows;
+}
+
+// A change made from the properties panel. The body did not move, so this
+// mirrors the dirty-state half of editorTextChanged() without restyling text.
+void Backend::frontmatterEdited() {
+    emit propertiesChanged();
+
+    const QString full = fullDocumentText();
+    const bool baselineKnown = m_hasKnownFileContents
+        || !m_fileUrl.isValid() || m_fileUrl.isEmpty();
+    if (baselineKnown && full == m_lastKnownFileText) {
+        setModified(false);
+        clearRecovery();
+        if (m_hasKnownFileContents)
+            setStatus(QStringLiteral("Saved %1").arg(fileName()));
+        else
+            setStatus(QString());
+        return;
+    }
+    setModified(true);
+    setStatus(QStringLiteral("Unsaved"));
+    scheduleRecovery();
+    scheduleAutoSave();
+}
+
+// Replaces one key's lines, creating the key at the end when it is missing.
+// Lines before and after it, comments included, are left alone.
+static bool writeFrontmatterKey(QString *frontmatter, const QString &key,
+                                const QStringList &block) {
+    QStringList lines = frontmatterLines(*frontmatter);
+    const int close = frontmatterClose(lines);
+    if (close < 0)
+        return false;
+
+    const QList<FrontmatterEntry> entries = parseFrontmatter(*frontmatter);
+    int first = -1;
+    int last = -1;
+    for (const FrontmatterEntry &entry : entries) {
+        if (entry.key == key) {
+            first = entry.firstLine;
+            last = entry.lastLine;
+            break;
+        }
+    }
+
+    QStringList updated;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (first >= 0 && i == first) {
+            updated.append(block);
+            i = last;
+            continue;
+        }
+        if (first < 0 && i == close) {
+            updated.append(block);
+            updated.append(lines.at(i));
+            continue;
+        }
+        updated.append(lines.at(i));
+    }
+    *frontmatter = composeFrontmatter(updated);
+    return true;
+}
+
+static QStringList tagBlock(const QString &key, const QStringList &tags) {
+    QStringList block{key + QLatin1Char(':')};
+    for (const QString &tag : tags)
+        block.append(QStringLiteral("  - ") + yamlScalar(tag));
+    return block;
+}
+
+static QStringList linkBlock(const QString &key, const QStringList &targets) {
+    QStringList block{key + QLatin1Char(':')};
+    for (const QString &target : targets)
+        block.append(QStringLiteral("  - \"[[") + target + QStringLiteral("]]\""));
+    return block;
+}
+
+static QStringList scalarBlock(const QString &key, const QString &value) {
+    return {value.isEmpty() ? key + QLatin1Char(':')
+                            : key + QStringLiteral(": ") + yamlScalar(value)};
+}
+
+static QStringList valuesForBlock(const QString &value) {
+    QStringList values;
+    for (const QString &part : value.split(QLatin1Char(','))) {
+        const QString cleaned = part.trimmed();
+        if (!cleaned.isEmpty() && !values.contains(cleaned))
+            values.append(cleaned);
+    }
+    return values;
+}
+
+bool Backend::setPropertyValue(const QString &key, const QString &value) {
+    const QString cleanedKey = key.trimmed();
+    if (cleanedKey.isEmpty() || cleanedKey.contains(QLatin1Char(':'))
+            || cleanedKey.contains(QLatin1Char('\n')))
+        return false;
+
+    QStringList lines = frontmatterLines(m_frontmatter);
+    if (frontmatterClose(lines) < 0)
+        return addProperty(cleanedKey, value);
+
+    QStringList block;
+    if (cleanedKey == QStringLiteral("up")) {
+        block = linkBlock(cleanedKey, valuesForBlock(value));
+    } else if (cleanedKey == QStringLiteral("tags") || cleanedKey == QStringLiteral("tag")) {
+        block = tagBlock(cleanedKey, valuesForBlock(value));
+    } else {
+        // Keep a list a list: editing a list property's text still writes
+        // items rather than folding it into one comma-joined string.
+        bool wasList = false;
+        for (const FrontmatterEntry &entry : parseFrontmatter(m_frontmatter)) {
+            if (entry.key == cleanedKey) {
+                wasList = entry.isList;
+                break;
+            }
+        }
+        block = wasList ? tagBlock(cleanedKey, valuesForBlock(value))
+                        : scalarBlock(cleanedKey, value);
+    }
+
+    if (!writeFrontmatterKey(&m_frontmatter, cleanedKey, block))
+        return false;
+    frontmatterEdited();
+    return true;
+}
+
+bool Backend::addProperty(const QString &key, const QString &value) {
+    const QString cleanedKey = key.trimmed();
+    if (cleanedKey.isEmpty() || cleanedKey.contains(QLatin1Char(':'))
+            || cleanedKey.contains(QLatin1Char('\n'))
+            || value.contains(QLatin1Char('\n')))
+        return false;
+
+    if (frontmatterClose(frontmatterLines(m_frontmatter)) < 0) {
+        // The note has no frontmatter yet: open one with this property.
+        m_frontmatter = QStringLiteral("---\n---\n");
+    }
+
+    QStringList block;
+    if (cleanedKey == QStringLiteral("up"))
+        block = linkBlock(cleanedKey, valuesForBlock(value));
+    else if (cleanedKey == QStringLiteral("tags") || cleanedKey == QStringLiteral("tag"))
+        block = tagBlock(cleanedKey, valuesForBlock(value));
+    else
+        block = scalarBlock(cleanedKey, value);
+
+    if (!writeFrontmatterKey(&m_frontmatter, cleanedKey, block))
+        return false;
+    frontmatterEdited();
+    return true;
+}
+
+bool Backend::removeProperty(const QString &key) {
+    QStringList lines = frontmatterLines(m_frontmatter);
+    const int close = frontmatterClose(lines);
+    if (close < 0)
+        return false;
+
+    const QList<FrontmatterEntry> entries = parseFrontmatter(m_frontmatter);
+    int first = -1;
+    int last = -1;
+    for (const FrontmatterEntry &entry : entries) {
+        if (entry.key == key) {
+            first = entry.firstLine;
+            last = entry.lastLine;
+            break;
+        }
+    }
+    if (first < 0)
+        return false;
+
+    QStringList updated;
+    for (int i = 0; i < lines.size(); ++i) {
+        if (i >= first && i <= last)
+            continue;
+        updated.append(lines.at(i));
+    }
+    m_frontmatter = frontmatterIsEmpty(updated) ? QString() : composeFrontmatter(updated);
+    frontmatterEdited();
+    return true;
+}
+
+bool Backend::addTag(const QString &tag) {
+    QString cleaned = tag.trimmed();
+    if (cleaned.startsWith(QLatin1Char('#')))
+        cleaned.remove(0, 1);
+    if (cleaned.isEmpty() || cleaned.contains(QRegularExpression(
+            QStringLiteral("\\s|,"))))
+        return false;
+
+    if (frontmatterClose(frontmatterLines(m_frontmatter)) < 0)
+        m_frontmatter = QStringLiteral("---\n---\n");
+
+    QString tagsKey = QStringLiteral("tags");
+    QStringList tags;
+    for (const FrontmatterEntry &entry : parseFrontmatter(m_frontmatter)) {
+        if (entry.key == QStringLiteral("tags") || entry.key == QStringLiteral("tag")) {
+            tagsKey = entry.key;
+            for (const QString &value : entry.values)
+                tags.append(cleanMetadataValue(value, false));
+            break;
+        }
+    }
+    if (tags.contains(cleaned))
+        return false;
+    tags.append(cleaned);
+
+    if (!writeFrontmatterKey(&m_frontmatter, tagsKey, tagBlock(tagsKey, tags)))
+        return false;
+    frontmatterEdited();
+    return true;
+}
+
+bool Backend::removeTag(const QString &tag) {
+    QString cleaned = tag.trimmed();
+    if (cleaned.startsWith(QLatin1Char('#')))
+        cleaned.remove(0, 1);
+
+    QString tagsKey = QStringLiteral("tags");
+    QStringList tags;
+    bool found = false;
+    for (const FrontmatterEntry &entry : parseFrontmatter(m_frontmatter)) {
+        if (entry.key == QStringLiteral("tags") || entry.key == QStringLiteral("tag")) {
+            tagsKey = entry.key;
+            for (const QString &value : entry.values) {
+                const QString current = cleanMetadataValue(value, false);
+                if (current == cleaned)
+                    found = true;
+                else
+                    tags.append(current);
+            }
+            break;
+        }
+    }
+    if (!found)
+        return false;
+
+    if (tags.isEmpty()) {
+        return removeProperty(tagsKey);
+    }
+    if (!writeFrontmatterKey(&m_frontmatter, tagsKey, tagBlock(tagsKey, tags)))
+        return false;
+    frontmatterEdited();
+    return true;
+}
+
+bool Backend::removePropertyValue(const QString &key, const QString &value) {
+    const bool link = key == QStringLiteral("up");
+    QStringList values;
+    bool found = false;
+    for (const FrontmatterEntry &entry : parseFrontmatter(m_frontmatter)) {
+        if (entry.key != key)
+            continue;
+        for (const QString &raw : entry.values) {
+            const QString current = cleanMetadataValue(raw, link);
+            if (current == value)
+                found = true;
+            else
+                values.append(current);
+        }
+        break;
+    }
+    if (!found)
+        return false;
+
+    if (values.isEmpty())
+        return removeProperty(key);
+
+    QStringList block = link ? linkBlock(key, values) : tagBlock(key, values);
+    if (!writeFrontmatterKey(&m_frontmatter, key, block))
+        return false;
+    frontmatterEdited();
+    return true;
 }
 
 QVariantMap Backend::noteFrontmatter(const QString &relativePath) {
@@ -2060,22 +2555,52 @@ void Backend::documentFontChanged() {
     applyHangingIndents(false);
 }
 
+// Splits a note into its YAML frontmatter (fences included) and the body the
+// editor shows. Only a block that opens the file with --- and closes with ---
+// or ... counts; a stray rule at the top stays prose.
+static void splitFrontmatter(const QString &text, QString *frontmatter, QString *body) {
+    *frontmatter = QString();
+    *body = text;
+    if (!text.startsWith(QStringLiteral("---\n")))
+        return;
+
+    int lineStart = text.indexOf(QLatin1Char('\n')) + 1;
+    while (lineStart < text.size()) {
+        int lineEnd = text.indexOf(QLatin1Char('\n'), lineStart);
+        if (lineEnd < 0)
+            lineEnd = text.size();
+        const QString line = text.mid(lineStart, lineEnd - lineStart).trimmed();
+        if (line == QStringLiteral("---") || line == QStringLiteral("...")) {
+            const int end = lineEnd < text.size() ? lineEnd + 1 : text.size();
+            *frontmatter = text.left(end);
+            *body = text.mid(end);
+            return;
+        }
+        if (lineEnd == text.size())
+            break;
+        lineStart = lineEnd + 1;
+    }
+}
+
 void Backend::loadDocumentText(const QString &text) {
     if (!m_document) {
         setStatus(QStringLiteral("Could not attach the Markdown renderer."));
         return;
     }
 
+    QString body;
+    splitFrontmatter(text, &m_frontmatter, &body);
     m_loading = true;
-    m_document->setPlainText(text);
-    m_lastDocumentText = text;
+    m_document->setPlainText(body);
+    m_lastDocumentText = body;
     m_loading = false;
 
     applyDocumentTypography();
     m_wordCountTimer.stop();
     m_wordCountStale = true;
     m_wordCountAgain = false;
-    setWordCount(countWords(text));
+    setWordCount(countWords(body));
+    emit propertiesChanged();
 }
 
 void Backend::setFileUrl(const QUrl &url) {
@@ -2121,7 +2646,7 @@ void Backend::saveTo(const QUrl &url) {
         return;
     }
 
-    const QByteArray contents = currentDocumentText().toUtf8();
+    const QByteArray contents = fullDocumentText().toUtf8();
     file.write(contents);
 
     // QSaveFile commits by replacing the target. Stop watching the old inode
@@ -2245,7 +2770,7 @@ void Backend::writeRecovery() {
     if (!file.open(QIODevice::WriteOnly))
         return;
     const QJsonObject recovery{{QStringLiteral("fileUrl"), m_fileUrl.toString()},
-                               {QStringLiteral("text"), currentDocumentText()}};
+                               {QStringLiteral("text"), fullDocumentText()}};
     file.write(QJsonDocument(recovery).toJson(QJsonDocument::Compact));
     file.commit();
 }

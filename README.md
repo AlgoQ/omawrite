@@ -94,6 +94,19 @@ Omawrite at the size it is designed around; larger and smaller sizes scale from 
 `Ctrl+=`, `Ctrl+-`, and `Ctrl+scroll` set your own size on top of that, from 50% to
 300% in browser-sized steps. It is remembered for the next window you open.
 
+## Properties
+
+A note's YAML frontmatter is drawn at the top of the page, above the writing,
+the way Obsidian shows Properties. The raw YAML never appears in the editor: the
+block is held aside while you write and goes back at the top of the file when it
+saves, so Obsidian and the VirtFolder tree still read it.
+
+Tags and `up:` links are chips. Click a tag's `×` to remove it, `+` to add one;
+click any other value to edit it in place. `+ Add property` appends a key and
+`−` beside a row removes it. Only the key being edited is rewritten, leaving
+comments, key order, and properties this panel does not understand untouched.
+The `⌄` in the heading folds the block away.
+
 ## Requirements
 
 - Qt 6: `qt6-base` and `qt6-declarative` (which includes Qt Quick Controls)
