@@ -4,6 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Omawrite is a distraction-free Markdown writing app for Omarchy, built with Qt 6 (Qt Quick/QML front end, C++ back end) and packaged for Arch.
 
+The next generation is in `next/`: Tauri 2, a Rust core, TypeScript and
+CodeMirror 6. Run it with `./bin/next`; its tests are `cargo test -p
+omawrite-core` and `npm test` inside `next/`. See `docs/omawrite-next.md`.
+
 ## Commands
 
 ```sh

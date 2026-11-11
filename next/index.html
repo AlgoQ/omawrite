@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omawrite</title>
+  </head>
+  <body>
+    <div id="app" class="app">
+      <aside id="sidebar" class="sidebar" hidden>
+        <header class="sidebar-header">
+          <span id="vault-name" class="vault-name">slipbox</span>
+          <div class="sidebar-actions">
+            <button class="icon-button" data-action="new-note" title="New note">+</button>
+            <button class="icon-button" data-action="refresh-index" title="Refresh">↻</button>
+            <button class="icon-button" data-action="close-sidebar" title="Close sidebar">«</button>
+          </div>
+        </header>
+        <input id="tree-filter" class="tree-filter" type="search" placeholder="Filter notes…" />
+        <div id="tree" class="tree" role="tree"></div>
+        <footer class="sidebar-footer">
+          <button class="text-button" data-action="open-vault">Open slipbox…</button>
+          <button class="text-button" data-action="open-file">Open file…</button>
+        </footer>
+      </aside>
+
+      <main class="page">
+        <header class="topbar">
+          <button class="icon-button" data-action="toggle-sidebar" title="Toggle sidebar (Ctrl+B)">☰</button>
+          <div id="tabs" class="tabs"></div>
+          <div class="topbar-actions">
+            <button class="icon-button" data-action="history-back" title="Back (Alt+Left)">←</button>
+            <button class="icon-button" data-action="history-forward" title="Forward (Alt+Right)">→</button>
+            <button class="icon-button" data-action="toggle-backlinks" title="Backlinks (Ctrl+Shift+B)">⇄</button>
+            <button class="icon-button" data-action="palette" title="Command palette (Ctrl+P)">⌘</button>
+            <button class="icon-button" data-action="settings" title="Settings">⚙</button>
+          </div>
+        </header>
+
+        <div id="external-banner" class="external-banner" hidden>
+          <span>This note is outside the slipbox.</span>
+          <button class="text-button" data-action="move-to-slipbox">Move to slipbox</button>
+          <button class="text-button" data-action="copy-to-slipbox">Copy to slipbox</button>
+        </div>
+
+        <div class="workspace">
+          <section id="editor-column" class="editor-column">
+            <div id="properties" class="properties"></div>
+            <div id="empty-state" class="empty-state">
+              <div class="empty-mark">◌</div>
+              <h1>Omawrite</h1>
+              <p>Select a note in the slipbox, or press <kbd>Ctrl</kbd>+<kbd>P</kbd> to search.</p>
+              <div class="empty-actions">
+                <button class="text-button" data-action="palette">Open a note</button>
+                <button class="text-button" data-action="new-note">New note</button>
+                <button class="text-button" data-action="open-vault">Open slipbox…</button>
+              </div>
+            </div>
+            <div id="editor" class="editor" hidden></div>
+          </section>
+
+          <aside id="backlinks" class="backlinks" hidden>
+            <header class="backlinks-header">
+              <span>Backlinks</span>
+              <button class="icon-button" data-action="close-backlinks" title="Close">×</button>
+            </header>
+            <div id="backlink-list" class="backlink-list"></div>
+          </aside>
+        </div>
+
+        <footer class="statusbar">
+          <span id="status-left"></span>
+          <span id="status-right"></span>
+        </footer>
+      </main>
+
+      <div id="palette" class="palette-overlay" hidden>
+        <div class="palette" role="dialog" aria-modal="true">
+          <div class="palette-search">
+            <span id="palette-mode" class="palette-mode">ALL</span>
+            <input id="palette-input" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="Find a note or run a command…" />
+          </div>
+          <div class="palette-body">
+            <div id="palette-list" class="palette-list" role="listbox"></div>
+            <div id="palette-preview" class="palette-preview" hidden></div>
+          </div>
+          <footer class="palette-footer">
+            <span><kbd>↑</kbd><kbd>↓</kbd> move</span>
+            <span><kbd>↵</kbd> open</span>
+            <span><kbd>Esc</kbd> close</span>
+          </footer>
+        </div>
+      </div>
+
+      <div id="settings" class="modal-overlay" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <header class="modal-header">
+            <h2 id="settings-title">Settings</h2>
+            <button class="icon-button" data-action="close-settings" title="Close">×</button>
+          </header>
+          <div class="modal-body">
+            <label class="setting-row">
+              <span>Scroll speed</span>
+              <span class="setting-control">
+                <input id="setting-scroll" type="range" min="0.5" max="4" step="0.5" />
+                <output id="setting-scroll-value"></output>
+              </span>
+            </label>
+            <label class="setting-row">
+              <span>Text size</span>
+              <span class="setting-control">
+                <input id="setting-font" type="range" min="12" max="32" step="1" />
+                <output id="setting-font-value"></output>
+              </span>
+            </label>
+            <label class="setting-row">
+              <span>Theme</span>
+              <select id="setting-theme">
+                <option value="auto">Follow Omarchy</option>
+                <option value="dark">Dark</option>
+                <option value="light">Light</option>
+              </select>
+            </label>
+            <div class="setting-section">
+              <h3>Keybindings</h3>
+              <p class="setting-hint">Click a shortcut, then press the keys. <kbd>Esc</kbd> cancels.</p>
+              <div id="keybinding-list" class="keybinding-list"></div>
+            </div>
+          </div>
+          <footer class="modal-footer">
+            <button class="text-button" data-action="reset-settings">Reset</button>
+            <button class="text-button primary" data-action="save-settings">Save</button>
+          </footer>
+        </div>
+      </div>
+
+      <div id="context-menu" class="context-menu" hidden></div>
+      <div id="toast" class="toast" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
