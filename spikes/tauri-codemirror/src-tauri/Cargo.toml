@@ -1,0 +1,24 @@
+[package]
+name = "omawrite-spike"
+version = "0.0.0"
+description = "Seam spike for the Omawrite rewrite: Tauri 2 + Rust vault command + CodeMirror 6"
+edition = "2021"
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary name on
+# Windows. See https://github.com/rust-lang/cargo/issues/8519.
+name = "omawrite_spike_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
