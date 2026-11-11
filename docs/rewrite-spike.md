@@ -1,15 +1,21 @@
-# Rewrite spike: Tauri, Electron, or a pure-Rust GUI
+# Rewrite spike: Tauri or a pure-Rust GUI
 
 Status: spike, 2026-11-11. Branch `feat/rewrite-spike`. Current app: Omawrite
 0.7.2 (Qt 6 / QML / C++17).
 
 ## Decision
 
-**Default: Tauri 2 + a Rust core + a TypeScript shell + CodeMirror 6.**
+**Default and only webview path: Tauri 2 + a Rust core + a TypeScript shell +
+CodeMirror 6.**
 
-**Fallback: Electron + TypeScript + CodeMirror 6**, reusing the same editor and
-shell package behind a small host adapter. Choose this if the WebKitGTK
-bake-off below fails, or if the team wants one language and no Rust.
+**Electron is excluded.** It is not a fallback, not a bake-off candidate, and
+not part of the porting plan. The comparison table below keeps it only as a
+rejected baseline so the reasoning is on record.
+
+**Fallback if WebKitGTK fails: do not switch to Electron.** Fix the WebKitGTK
+issues, wait for Tauri 3 + CEF to stabilize, or accept a pure-Rust GUI. The
+first two keep the TypeScript editor package; the last one means rebuilding the
+editor. Those are the only options on the table.
 
 **Not recommended for this product: a pure-Rust GUI (iced or GPUI) with a
 Rust/WASM plugin model.** It is the best answer only if "no webview, one small
@@ -64,7 +70,7 @@ the shell; it is dominated by the editor seam and the vault/index semantics.
 
 Scores are relative to this product, not general-purpose rankings.
 
-| Criterion | (a) Tauri 2 + Rust + TS + CM6 | (b) Electron + TS + CM6 | (c) Pure Rust GUI + Rust/WASM plugins |
+| Criterion | (a) Tauri 2 + Rust + TS + CM6 | (b) Electron + TS + CM6 (rejected baseline) | (c) Pure Rust GUI + Rust/WASM plugins |
 | --- | --- | --- | --- |
 | Markdown live preview and tables | Strong primitives; CM6 is the editor Obsidian itself uses; table widget is custom but proven | Same editor as (a); shell does not change editor maturity | Weak; no CM6-class decoration/widget layer; live preview and tables are custom rendering |
 | Plugin authoring language | TS/JS for UI and editor extensions; Rust or WASM for privileged work | TS/JS everywhere; Node in main or utility process | Rust native plugins, or WASM; smallest author pool |
@@ -118,7 +124,7 @@ layout, and the editing surface remain your problem. GPUI is Zed's
 GPU-accelerated framework, explicitly pre-1.0 with breaking changes between
 versions; Zed's editor is not packaged as a general-purpose reusable editor.
 Embedding a webview inside a Rust GUI would recover CM6, but then the stack is
-Tauri-or-Electron tradeoffs with an extra native layer, not a pure-Rust win.
+Tauri-with-a-webview tradeoffs and an extra native layer, not a pure-Rust win.
 
 ### Plugin authoring and sandboxing
 
@@ -131,13 +137,15 @@ means Omawrite must build its own plugin host in every option.
   extensions; privileged work is Rust or WASM. You get the largest author pool
   and the CM6 extension API. The cost is that you must build the manifest,
   permission, install, and isolation layers yourself.
-- **Electron + TS:** plugin authors write TS/JS everywhere. Electron gives
-  mature primitives: renderer sandbox on by default since Electron 20,
-  `contextIsolation` on by default since 12, preload scripts with
+- **Electron + TS (excluded):** plugin authors write TS/JS everywhere.
+  Electron gives mature primitives: renderer sandbox on by default since
+  Electron 20, `contextIsolation` on by default since 12, preload scripts with
   `contextBridge`, and `utilityProcess` for Node-side work. But an
   Obsidian-style plugin that runs in the renderer shares the DOM with the app;
   a plugin in the main process has full Node. Neither is a sandbox by default.
-  You still have to design the capability API.
+  You still have to design the capability API. It is not part of this plan: the
+  product does not need a bundled Chromium, and Tauri already provides the
+  webview and Rust seam with a much smaller artifact.
 - **Pure Rust:** native Rust plugins are fast and fully trusted; any untrusted
   plugin must be WASM. Wasmtime/WASI gives capability-based filesystem access
   and a real sandbox, but plugin authors must write Rust, AssemblyScript, or
@@ -585,9 +593,9 @@ It is not wired into `omawrite.pro` or `tests/tests.pro`.
    CLI flags, release pipeline.
 
 The order matters: the editor bake-off can kill the Tauri default before the
-team spends months on the Rust core. If WebKitGTK fails, move the same
-TypeScript editor package to Electron and keep the Rust core as a sidecar or
-port it to Node.
+team spends months on the Rust core. If WebKitGTK fails, the TypeScript editor
+package stays; the host does not move to Electron. The next decision is Tauri 3
++ CEF when it stabilizes, or a pure-Rust GUI with the editor rebuilt.
 
 ## What is still unknown
 
