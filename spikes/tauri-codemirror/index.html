@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omawrite rewrite spike</title>
+  </head>
+  <body>
+    <main id="app">
+      <header class="spike-header">
+        <div>
+          <h1>Omawrite rewrite spike</h1>
+          <p class="subtitle">Tauri 2 + Rust vault command + CodeMirror 6 Markdown live preview</p>
+        </div>
+        <div class="vault">
+          <span class="vault-label">vault root</span>
+          <code id="vault-root">asking Rust…</code>
+        </div>
+      </header>
+      <div id="editor"></div>
+      <footer class="spike-footer">
+        <span>Put the caret in the table: raw Markdown returns. Move it out: the widget renders.</span>
+        <span id="status">editor starting…</span>
+      </footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
