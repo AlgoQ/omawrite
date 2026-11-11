@@ -39,6 +39,15 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
   `Esc` work it from the field; a `CMD` or `FILE` badge says which kind a row
   is. Commands run the same handler as their keyboard shortcut, and file rows
   open in a tab.
+- Right-click a note in the file viewer, or a tab, to file it. **Move to
+  slipbox** and **Copy to slipbox** put it at the vault root; **Move/Copy to
+  folder…** asks for a folder in the portal picker. Names never overwrite:
+  a second `Note.md` becomes `Note 1.md`. `[[wikilinks]]` and `up:` values
+  that point at the note, or out of it, are rewritten with aliases and
+  headings left in place, and a move keeps the open note, its tabs, and the
+  back/forward history on the new path. Relative Markdown image paths are not
+  updated, so a note that leaves its folder may need them fixed; Obsidian's
+  `![[image]]` embeds keep working.
 - `Ctrl+Shift+O` opens the command palette in file-only mode, the searchable
   list of the other notes in the slipbox.
 - `Ctrl+Shift+B` toggles a Linked mentions panel listing the notes that link to

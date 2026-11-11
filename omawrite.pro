@@ -10,6 +10,7 @@ HEADERS += \
     src/cli.h \
     src/markdownhighlighter.h \
     src/noteindex.h \
+    src/noteoperations.h \
     src/systemtheme.h \
     src/vault.h
 
@@ -20,6 +21,7 @@ SOURCES += \
     src/cli.cpp \
     src/markdownhighlighter.cpp \
     src/noteindex.cpp \
+    src/noteoperations.cpp \
     src/systemtheme.cpp \
     src/vault.cpp
 

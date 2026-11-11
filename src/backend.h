@@ -137,6 +137,11 @@ public:
     Q_INVOKABLE void refreshNoteIndex();
     Q_INVOKABLE void invalidateNoteIndex();
     Q_INVOKABLE QVariantList noteSuggestions(const QString &query);
+    // Note operations: move or copy a note into a folder, rewriting the
+    // wikilinks and up: values that pointed at it or that it pointed at. The
+    // result carries success, newUrl, newPath, changedLinks and warnings.
+    Q_INVOKABLE QVariantMap moveNote(const QString &url, const QString &destinationFolder);
+    Q_INVOKABLE QVariantMap copyNote(const QString &url, const QString &destinationFolder);
     // The frontmatter a note carries: its up: parents (wikilink targets with
     // brackets, aliases, and headings stripped) and its tags.
     Q_INVOKABLE QVariantMap noteFrontmatter(const QString &relativePath);
@@ -226,6 +231,9 @@ signals:
     void saveDialogRequested(const QUrl &suggestedUrl);
     void saveSucceeded();
     void externalChangeDetected(bool deleted, bool locallyModified);
+    // A note was moved, so the tabs and back/forward history that still name
+    // its old URL can follow it before the backend opens the new one.
+    void noteMoved(const QUrl &from, const QUrl &to);
     void scrollSpeedChanged();
     void propertiesChanged();
     void treeModeChanged();
@@ -280,6 +288,10 @@ private:
     void checkWatchedFile();
     void loadOmarchyTheme();
     void watchOmarchyTheme();
+    // Shared tail of moveNote/copyNote: refreshes the index, keeps the open
+    // document and QML's tabs/history on the new path, and writes the footer
+    // status. The map is the one returned to QML.
+    QVariantMap finishNoteOperation(QVariantMap result, bool moving, const QUrl &sourceUrl);
 
     QUrl m_fileUrl;
     bool m_modified = false;

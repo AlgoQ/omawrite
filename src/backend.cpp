@@ -50,6 +50,7 @@
 
 #include "markdownhighlighter.h"
 #include "blockrenderer.h"
+#include "noteoperations.h"
 
 constexpr qreal typoraLineHeightPercent = 140;
 
@@ -1207,6 +1208,196 @@ void Backend::invalidateNoteIndex() {
 QVariantList Backend::noteSuggestions(const QString &query) {
     refreshNoteIndex();
     return m_noteIndex.suggestions(query);
+}
+
+
+// Paths reach the backend both as plain paths from the tree and as file URLs
+// from dialogs, and both spellings have to work for the same operation.
+static QString localPathArgument(const QString &value)
+{
+    const QUrl url(value);
+    if (url.isLocalFile())
+        return url.toLocalFile();
+    return QDir::cleanPath(value);
+}
+
+static bool sameLocalPath(const QString &a, const QString &b)
+{
+    if (a.isEmpty() || b.isEmpty())
+        return false;
+    return QDir::cleanPath(QFileInfo(a).absoluteFilePath())
+        == QDir::cleanPath(QFileInfo(b).absoluteFilePath());
+}
+
+static QVariantMap noteOperationFailure(const QString &error)
+{
+    return QVariantMap{
+        {QStringLiteral("success"), false},
+        {QStringLiteral("error"), error},
+        {QStringLiteral("newUrl"), QUrl()},
+        {QStringLiteral("newPath"), QString()},
+        {QStringLiteral("changedLinks"), 0},
+        {QStringLiteral("changedFiles"), QStringList()},
+        {QStringLiteral("warnings"), QStringList()}};
+}
+
+static QVariantMap noteOperationMap(const NoteOperations::Result &result)
+{
+    return QVariantMap{
+        {QStringLiteral("success"), result.success},
+        {QStringLiteral("error"), result.error},
+        {QStringLiteral("newUrl"), result.success
+             ? QVariant::fromValue(QUrl::fromLocalFile(result.destinationPath)) : QVariant()},
+        {QStringLiteral("newPath"), result.destinationPath},
+        {QStringLiteral("changedLinks"), result.changedLinks},
+        {QStringLiteral("changedFiles"), result.changedFiles},
+        {QStringLiteral("warnings"), result.warnings}};
+}
+
+// Moving a note is a filesystem change made on the writer's behalf, like a
+// save: text still waiting for auto-save is written first so the move carries
+// it along instead of leaving it in a document whose file has gone.
+QVariantMap Backend::moveNote(const QString &url, const QString &destinationFolder)
+{
+    const QString sourceArgument = localPathArgument(url);
+    const QString folderArgument = localPathArgument(destinationFolder);
+    if (sourceArgument.isEmpty() || folderArgument.isEmpty()) {
+        const QVariantMap failure = noteOperationFailure(
+            QStringLiteral("There is no note or folder to move."));
+        setStatus(failure.value(QStringLiteral("error")).toString());
+        return failure;
+    }
+    const QString sourcePath = QFileInfo(sourceArgument).absoluteFilePath();
+    const QString folder = QFileInfo(folderArgument).absoluteFilePath();
+    const QFileInfo sourceInfo(sourcePath);
+    if (!sourceInfo.isFile()) {
+        const QVariantMap failure = noteOperationFailure(
+            QStringLiteral("%1 is not a note.").arg(sourceInfo.fileName()));
+        setStatus(failure.value(QStringLiteral("error")).toString());
+        return failure;
+    }
+
+    // The move can rewrite the open note, whether it is the note being moved
+    // or one linking to it, so unsaved text is saved first. An untitled draft
+    // has no file to rewrite and is left alone.
+    if (m_modified && m_fileUrl.isLocalFile()) {
+        save();
+        if (m_modified) {
+            const QVariantMap failure = noteOperationFailure(
+                QStringLiteral("Could not save %1 before moving.").arg(fileName()));
+            setStatus(failure.value(QStringLiteral("error")).toString());
+            return failure;
+        }
+    }
+
+    refreshNoteIndex();
+    NoteOperations operations(m_vault.root(), m_noteIndex.paths());
+    const NoteOperations::Result result = operations.moveNote(sourcePath, folder);
+    return finishNoteOperation(noteOperationMap(result), true,
+                               QUrl::fromLocalFile(sourcePath));
+}
+
+QVariantMap Backend::copyNote(const QString &url, const QString &destinationFolder)
+{
+    const QString sourceArgument = localPathArgument(url);
+    const QString folderArgument = localPathArgument(destinationFolder);
+    if (sourceArgument.isEmpty() || folderArgument.isEmpty()) {
+        const QVariantMap failure = noteOperationFailure(
+            QStringLiteral("There is no note or folder to copy."));
+        setStatus(failure.value(QStringLiteral("error")).toString());
+        return failure;
+    }
+    const QString sourcePath = QFileInfo(sourceArgument).absoluteFilePath();
+    const QString folder = QFileInfo(folderArgument).absoluteFilePath();
+    const QFileInfo sourceInfo(sourcePath);
+    if (!sourceInfo.isFile()) {
+        const QVariantMap failure = noteOperationFailure(
+            QStringLiteral("%1 is not a note.").arg(sourceInfo.fileName()));
+        setStatus(failure.value(QStringLiteral("error")).toString());
+        return failure;
+    }
+
+    if (m_modified && m_fileUrl.isLocalFile()) {
+        save();
+        if (m_modified) {
+            const QVariantMap failure = noteOperationFailure(
+                QStringLiteral("Could not save %1 before copying.").arg(fileName()));
+            setStatus(failure.value(QStringLiteral("error")).toString());
+            return failure;
+        }
+    }
+
+    refreshNoteIndex();
+    NoteOperations operations(m_vault.root(), m_noteIndex.paths());
+    const NoteOperations::Result result = operations.copyNote(sourcePath, folder);
+    return finishNoteOperation(noteOperationMap(result), false,
+                               QUrl::fromLocalFile(sourcePath));
+}
+
+QVariantMap Backend::finishNoteOperation(QVariantMap result, bool moving,
+                                         const QUrl &sourceUrl)
+{
+    if (!result.value(QStringLiteral("success")).toBool()) {
+        setStatus(result.value(QStringLiteral("error")).toString());
+        return result;
+    }
+
+    const QString destination = result.value(QStringLiteral("newPath")).toString();
+    const QUrl destinationUrl = QUrl::fromLocalFile(destination);
+    const QString sourcePath = sourceUrl.toLocalFile();
+    const bool sourceIsOpen = m_fileUrl.isLocalFile()
+        && sameLocalPath(m_fileUrl.toLocalFile(), sourcePath);
+    const bool stayedPut = sameLocalPath(sourcePath, destination);
+    const QStringList changedFiles = result.value(QStringLiteral("changedFiles")).toStringList();
+    bool openNoteRewritten = false;
+    if (m_fileUrl.isLocalFile()) {
+        for (const QString &changed : changedFiles) {
+            if (sameLocalPath(changed, m_fileUrl.toLocalFile()))
+                openNoteRewritten = true;
+        }
+    }
+
+    // The tree and the quick-open list read the index as soon as the URL
+    // signal fires, so the new path must be in it by then.
+    refreshNoteIndex();
+
+    if (moving && !stayedPut) {
+        // Tabs and history follow the note before open() arrives with the new
+        // URL; otherwise the old entry would look like a separate visit.
+        emit noteMoved(sourceUrl, destinationUrl);
+        if (sourceIsOpen) {
+            open(destinationUrl);
+            // Opening the new path can change which folder is the slipbox —
+            // a note moved in from outside now has a vault around it — so the
+            // index is read again from where the note landed.
+            refreshNoteIndex();
+        } else if (openNoteRewritten) {
+            // A note holding an inbound link was rewritten on disk behind the
+            // editor. Reload it so the text and the file agree again.
+            open(m_fileUrl);
+        }
+    } else if (!moving && openNoteRewritten) {
+        open(m_fileUrl);
+    }
+
+    const QString folderPath = QFileInfo(destination).absolutePath();
+    const QString folderName = sameLocalPath(folderPath, m_vault.root())
+        ? QStringLiteral("the slipbox") : QFileInfo(folderPath).fileName();
+    QString status;
+    if (stayedPut) {
+        status = QStringLiteral("%1 is already in that folder.").arg(QFileInfo(sourcePath).fileName());
+    } else if (moving) {
+        status = QStringLiteral("Moved %1 to %2").arg(QFileInfo(sourcePath).fileName(), folderName);
+    } else {
+        status = QStringLiteral("Copied %1 to %2").arg(QFileInfo(sourcePath).fileName(), folderName);
+    }
+    const int changedLinks = result.value(QStringLiteral("changedLinks")).toInt();
+    if (changedLinks > 0) {
+        status += QStringLiteral(" (%1 link%2 updated)")
+            .arg(changedLinks).arg(changedLinks == 1 ? QString() : QStringLiteral("s"));
+    }
+    setStatus(status);
+    return result;
 }
 
 QString Backend::fullDocumentText() const {

@@ -237,6 +237,10 @@ ApplicationWindow {
     property var expandedFolders: ({})
     property var linksExpanded: ({})
     property var treeRows: []
+    // The note a right-click menu was opened on, and the folder a Move/Copy
+    // to folder is waiting for once the portal picker returns.
+    property string pendingNoteFolderUrl: ""
+    property string pendingNoteFolderAction: ""
 
     function rebuildTree() {
         if (!sidebarOpen)
@@ -389,6 +393,36 @@ ApplicationWindow {
         if (!foldable || row.expanded === open)
             return;
         toggleTreeRow(index);
+    }
+
+    // Filing actions. The backend does the filesystem work and rewrites the
+    // links; the window only has to reread what the move changed around it.
+    function showNoteContextMenu(noteUrl) {
+        noteContextMenu.noteUrl = noteUrl.toString();
+        noteContextMenu.popup();
+    }
+
+    function showTreeContextMenu(index) {
+        if (index < 0 || index >= treeRows.length || treeRows[index].isDir)
+            return;
+        sidebarList.currentIndex = index;
+        showNoteContextMenu(treeRows[index].url);
+    }
+
+    function moveNoteTo(noteUrl, folder) {
+        var result = backend.moveNote(noteUrl.toString(), folder.toString());
+        if (result.success && win.sidebarOpen)
+            win.rebuildTree();
+        win.refreshBacklinks();
+        return result;
+    }
+
+    function copyNoteTo(noteUrl, folder) {
+        var result = backend.copyNote(noteUrl.toString(), folder.toString());
+        if (result.success && win.sidebarOpen)
+            win.rebuildTree();
+        win.refreshBacklinks();
+        return result;
     }
 
     // Linked mentions: the notes that link to the open one, as a panel
@@ -1024,6 +1058,40 @@ ApplicationWindow {
             }
         }
 
+        // A move renames a file the tabs and the back/forward list still know
+        // by its old URL. Replace it there before the backend opens the new
+        // path, so the move reads as one visit rather than two.
+        function onNoteMoved(fromUrl, toUrl) {
+            var from = fromUrl.toString();
+            var to = toUrl.toString();
+
+            var list = win.tabs.slice();
+            var tabsChanged = false;
+            for (var i = 0; i < list.length; ++i) {
+                if (list[i].url === from) {
+                    list[i] = { url: to, caret: list[i].caret };
+                    tabsChanged = true;
+                }
+            }
+            if (tabsChanged)
+                win.tabs = list;
+
+            var history = win.fileHistory.slice();
+            var historyChanged = false;
+            for (var j = 0; j < history.length; ++j) {
+                if (history[j] === from) {
+                    history[j] = to;
+                    historyChanged = true;
+                }
+            }
+            if (historyChanged)
+                win.fileHistory = history;
+
+            if (win.sidebarOpen)
+                win.rebuildTree();
+            win.refreshBacklinks();
+        }
+
         function onOpenDialogRequested() {
             // Start at the vault root when the note belongs to one, so the
             // picker reaches any note in the slipbox; otherwise stay beside
@@ -1088,6 +1156,78 @@ ApplicationWindow {
             win.awaitingPendingSave = false;
             win.pendingAction = "";
             win.historyPending = -1;
+        }
+    }
+
+    // A note's filing menu, from the file viewer or a tab. "To slipbox" is the
+    // vault root; the folder commands use the same portal picker as Open.
+    Menu {
+        id: noteContextMenu
+        objectName: "noteContextMenu"
+        property string noteUrl: ""
+
+        MenuItem {
+            objectName: "noteMenuMoveSlipbox"
+            text: "Move to slipbox"
+            font.family: backend.editorFont
+            font.pixelSize: win.scaledSize(13)
+            onTriggered: win.moveNoteTo(noteContextMenu.noteUrl, backend.fileTreeRoot)
+        }
+
+        MenuItem {
+            objectName: "noteMenuCopySlipbox"
+            text: "Copy to slipbox"
+            font.family: backend.editorFont
+            font.pixelSize: win.scaledSize(13)
+            onTriggered: win.copyNoteTo(noteContextMenu.noteUrl, backend.fileTreeRoot)
+        }
+
+        MenuSeparator {}
+
+        MenuItem {
+            objectName: "noteMenuMoveFolder"
+            text: "Move to folder…"
+            font.family: backend.editorFont
+            font.pixelSize: win.scaledSize(13)
+            onTriggered: {
+                win.pendingNoteFolderUrl = noteContextMenu.noteUrl;
+                win.pendingNoteFolderAction = "move";
+                noteFolderDialog.currentFolder = backend.documentFolder;
+                noteFolderDialog.open();
+            }
+        }
+
+        MenuItem {
+            objectName: "noteMenuCopyFolder"
+            text: "Copy to folder…"
+            font.family: backend.editorFont
+            font.pixelSize: win.scaledSize(13)
+            onTriggered: {
+                win.pendingNoteFolderUrl = noteContextMenu.noteUrl;
+                win.pendingNoteFolderAction = "copy";
+                noteFolderDialog.currentFolder = backend.documentFolder;
+                noteFolderDialog.open();
+            }
+        }
+    }
+
+    Dialogs.FolderDialog {
+        id: noteFolderDialog
+        objectName: "noteFolderDialog"
+        title: win.pendingNoteFolderAction === "copy"
+            ? "Copy Note to Folder" : "Move Note to Folder"
+        onAccepted: {
+            if (win.pendingNoteFolderAction === "move") {
+                win.moveNoteTo(win.pendingNoteFolderUrl, selectedFolder);
+            } else if (win.pendingNoteFolderAction === "copy") {
+                win.copyNoteTo(win.pendingNoteFolderUrl, selectedFolder);
+            }
+            win.pendingNoteFolderUrl = "";
+            win.pendingNoteFolderAction = "";
+        }
+        onRejected: {
+            win.pendingNoteFolderUrl = "";
+            win.pendingNoteFolderAction = "";
         }
     }
 
@@ -3131,7 +3271,12 @@ ApplicationWindow {
                         id: treeMouse
                         anchors.fill: parent
                         hoverEnabled: true
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
                         onClicked: {
+                            if (mouse.button === Qt.RightButton) {
+                                win.showTreeContextMenu(treeRow.index);
+                                return;
+                            }
                             sidebarList.currentIndex = treeRow.index;
                             win.activateTreeRow(treeRow.index);
                         }
@@ -3232,8 +3377,12 @@ ApplicationWindow {
                     id: tabMouse
                     anchors.fill: parent
                     hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+                    acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
                     onClicked: function(mouse) {
+                        if (mouse.button === Qt.RightButton) {
+                            win.showNoteContextMenu(tabItem.modelData.url);
+                            return;
+                        }
                         if (mouse.button === Qt.MiddleButton)
                             win.closeTab(tabItem.index);
                         else

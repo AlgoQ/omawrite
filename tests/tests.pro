@@ -11,6 +11,7 @@ SOURCES += \
     ../src/cli.cpp \
     ../src/markdownhighlighter.cpp \
     ../src/noteindex.cpp \
+    ../src/noteoperations.cpp \
     ../src/vault.cpp
 HEADERS += \
     ../src/backend.h \
@@ -18,6 +19,7 @@ HEADERS += \
     ../src/cli.h \
     ../src/markdownhighlighter.h \
     ../src/noteindex.h \
+    ../src/noteoperations.h \
     ../src/vault.h
 
 QT += widgets printsupport quickcontrols2 quickdialogs2 dbus
