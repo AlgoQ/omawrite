@@ -845,7 +845,7 @@ private slots:
         QVERIFY(window);
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window));
-        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier);
         QObject *header = window->findChild<QObject *>(QStringLiteral("fileViewerRoot"));
         QVERIFY(header);
         QTRY_COMPARE(header->property("text").toString(), first.dirName());
