@@ -29,9 +29,11 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
   under the notes their `up:` frontmatter field names, orphans as roots, with
   a child count beside each parent. Generated exports under `drawings/` stay
   out of the tree. Folders mode walks the disk instead. Click a note to open
-  it in a tab, or use the arrow keys and `Enter`; `←`/`→` fold and unfold,
-  `«` in the header and `Esc` close the tree. "Open another location…" at its
-  foot opens the portal picker for files outside the tree.
+  it in a tab; the `›`/`⌄` beside a note with children folds them without
+  opening it. Use the arrow keys and `Enter` the same way; `←`/`→` fold and
+  unfold, `«` in the header and `Esc` close the tree. "Open another location…"
+  at its foot opens the portal picker for files outside the tree, starting at
+  the vault root when the note is in one.
 - `Ctrl+P` opens the command palette: one search box over every action and
   every note in the slipbox. `↑`/`↓`, `Page Up`/`Page Down`, `Enter`, and
   `Esc` work it from the field; a `CMD` or `FILE` badge says which kind a row

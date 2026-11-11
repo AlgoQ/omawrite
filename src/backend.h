@@ -14,6 +14,9 @@
 #include <QVariantList>
 #include <memory>
 
+#include "noteindex.h"
+#include "vault.h"
+
 class MarkdownHighlighter;
 class QFont;
 class QTextBlock;
@@ -25,6 +28,13 @@ class Backend : public QObject {
     Q_OBJECT
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY fileUrlChanged)
     Q_PROPERTY(QUrl documentFolder READ documentFolder NOTIFY fileUrlChanged)
+    // The slipbox root the file viewer reads, and the open note's path inside
+    // it. Notify, so a header bound to the root and a row bound to the current
+    // path follow a tab switch or a new vault without a rebuild asking them.
+    Q_PROPERTY(QString vaultRoot READ vaultRoot NOTIFY vaultRootChanged)
+    Q_PROPERTY(QString fileTreeRoot READ fileTreeRoot NOTIFY fileTreeRootChanged)
+    Q_PROPERTY(QString fileTreeCurrentPath READ fileTreeCurrentPath
+                   NOTIFY fileTreeCurrentPathChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY fileUrlChanged)
     Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
@@ -59,6 +69,13 @@ public:
 
     QUrl fileUrl() const { return m_fileUrl; }
     QUrl documentFolder() const;
+    // The slipbox root: the nearest .obsidian ancestor, else the open note's
+    // folder. Empty until there is a note or a remembered save folder. The
+    // root a QML binding reads, with the home fallback the viewer uses.
+    QString vaultRoot() const;
+    // The folder the open dialog starts in: the vault root when there is one,
+    // otherwise the open note's folder or the last save folder.
+    Q_INVOKABLE QUrl openDialogFolder() const;
     QString fileName() const;
 
     bool modified() const { return m_modified; }
@@ -111,9 +128,13 @@ public:
     Q_INVOKABLE QVariantList taskMarkers() const;
     Q_INVOKABLE bool toggleTaskAt(int position);
     Q_INVOKABLE void openExternalUrl(const QString &url);
-    Q_INVOKABLE QVariantMap wikiLinkAt(int position) const;
+    Q_INVOKABLE QVariantMap wikiLinkAt(int position);
     Q_INVOKABLE void reportMissingNote(const QString &target);
+    // The index refreshes from its warm snapshot; invalidation is the hook for
+    // changes the watcher cannot see. refreshNoteIndex() is the public entry
+    // point QML and tests already call, and costs nothing when it is warm.
     Q_INVOKABLE void refreshNoteIndex();
+    Q_INVOKABLE void invalidateNoteIndex();
     Q_INVOKABLE QVariantList noteSuggestions(const QString &query);
     // The frontmatter a note carries: its up: parents (wikilink targets with
     // brackets, aliases, and headings stripped) and its tags.
@@ -181,6 +202,10 @@ public:
 
 signals:
     void fileUrlChanged();
+    void vaultRootChanged();
+    void fileTreeRootChanged();
+    void fileTreeCurrentPathChanged();
+    void noteIndexChanged();
     void modifiedChanged();
     void statusChanged();
     void wordCountChanged();
@@ -205,18 +230,7 @@ private:
     QString fullDocumentText() const;
     void frontmatterEdited();
     void applyHangingIndents(bool clearUndo);
-    QString notesRoot() const;
-    QUrl resolveNote(const QString &target) const;
-    // A note's frontmatter parents and tags, by index-relative path. Read
-    // with the index, so the link tree never re-reads the vault per row.
-    struct NoteMeta {
-        QStringList ups;
-        QStringList tags;
-    };
-    // An up: target resolved against the note that names it, as an
-    // index-relative path. Empty when it names nothing unambiguous.
-    QString resolveUpTarget(const QString &target, const QString &sourceDir) const;
-    static NoteMeta readNoteFrontmatter(const QString &absolutePath);
+    QUrl resolveNote(const QString &target);
     QString attachmentDirectory(bool *vault) const;
     QString resolveImage(const QString &target, bool wiki) const;
     // Where an image line's picture is and the size it is drawn at, or an
@@ -296,10 +310,10 @@ private:
     QString m_recoveryPath;
     std::unique_ptr<QLockFile> m_recoveryLock;
     // Markdown notes beside the open document, cached for [[ suggestions.
-    QString m_notesRoot;
-    QStringList m_notePaths;
-    bool m_notesIndexed = false;
-    QHash<QString, NoteMeta> m_noteMeta;
+    // Vault owns where the slipbox starts and ends; the index owns one warm
+    // snapshot of its notes, links and metadata.
+    Vault m_vault;
+    NoteIndex m_noteIndex;
     // Wheel-scroll multiplier for the editor and the file viewer, and which
     // tree the viewer shows. Both persist across windows.
     double m_scrollSpeed = 2.0;

@@ -446,6 +446,16 @@ Backend::Backend(QObject *parent) : QObject(parent) {
     const QString storedMode = QSettings().value(treeModeSetting, QStringLiteral("links")).toString();
     m_treeMode = storedMode == QStringLiteral("folders") ? storedMode : QStringLiteral("links");
 
+    m_vault.setFallbackFolderProvider([] {
+        return QSettings().value(lastSaveDirectorySetting).toString();
+    });
+    // The watcher marks the index stale when notes move outside Omawrite. The
+    // window redraws once the burst of events settles, not per event.
+    connect(&m_noteIndex, &NoteIndex::changed, this, [this] {
+        refreshNoteIndex();
+        emit noteIndexChanged();
+    });
+
     const QString stateDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(stateDirectory);
     // Claim an orphaned snapshot before taking an empty slot. This ensures a
@@ -515,11 +525,20 @@ void Backend::setParentWindow(QWindow *window) {
 }
 
 QUrl Backend::documentFolder() const {
-    if (m_fileUrl.isLocalFile())
-        return QUrl::fromLocalFile(QFileInfo(m_fileUrl.toLocalFile()).absolutePath());
+    const QString folder = m_vault.documentFolder();
+    return folder.isEmpty() ? QUrl() : QUrl::fromLocalFile(folder);
+}
 
-    const QString lastFolder = QSettings().value(lastSaveDirectorySetting).toString();
-    return lastFolder.isEmpty() ? QUrl() : QUrl::fromLocalFile(lastFolder);
+QString Backend::vaultRoot() const {
+    return m_vault.root();
+}
+
+QUrl Backend::openDialogFolder() const {
+    m_vault.refreshRoot();
+    const QString root = m_vault.root();
+    if (!root.isEmpty())
+        return QUrl::fromLocalFile(root);
+    return documentFolder();
 }
 
 QString Backend::fileName() const {
@@ -1142,217 +1161,32 @@ void Backend::openExternalUrl(const QString &url) {
         setStatus(QStringLiteral("Could not open %1").arg(url));
 }
 
-// The note's folder, or the nearest folder above it that holds an Obsidian
-// vault marker. A slipbox is often nested (ai/, drawings/), and [[links]]
-// resolve across the whole vault, not just beside the current file.
-QString Backend::notesRoot() const {
-    QString start;
-    if (m_fileUrl.isLocalFile())
-        start = QFileInfo(m_fileUrl.toLocalFile()).absolutePath();
-    else
-        start = QSettings().value(lastSaveDirectorySetting).toString();
-    if (start.isEmpty())
-        return {};
+// The index owns the walk and the frontmatter parse. A refresh costs a
+// directory walk only when something invalidated the snapshot, so quick open
+// and every link can ask without paying for the vault each time.
+void Backend::refreshNoteIndex() {
+    const QString previousRoot = m_vault.root();
+    const QString previousTreeRoot = fileTreeRoot();
+    const QString previousPath = fileTreeCurrentPath();
 
-    QDir directory(start);
-    while (true) {
-        if (QDir(directory.filePath(QStringLiteral(".obsidian"))).exists())
-            return directory.absolutePath();
-        if (!directory.cdUp())
-            break;
-    }
-    return QDir(start).absolutePath();
+    const bool rootMoved = m_vault.refreshRoot();
+    m_noteIndex.refresh(m_vault.root(), false);
+
+    if (rootMoved || previousRoot != m_vault.root())
+        emit vaultRootChanged();
+    if (previousTreeRoot != fileTreeRoot())
+        emit fileTreeRootChanged();
+    if (previousPath != fileTreeCurrentPath())
+        emit fileTreeCurrentPathChanged();
 }
 
-void Backend::refreshNoteIndex() {
-    m_notesRoot = notesRoot();
-    m_notePaths.clear();
-    m_noteMeta.clear();
-    m_notesIndexed = true;
-    if (m_notesRoot.isEmpty())
-        return;
-
-    const QDir root(m_notesRoot);
-    QDirIterator iterator(m_notesRoot, {QStringLiteral("*.md"), QStringLiteral("*.markdown")},
-                          QDir::Files, QDirIterator::Subdirectories);
-    while (iterator.hasNext()) {
-        const QString relative = root.relativeFilePath(iterator.next());
-        // Obsidian keeps its settings and trash in dot folders; neither holds
-        // notes the writer means to link to.
-        if (relative.startsWith(QLatin1Char('.'))
-                || relative.contains(QStringLiteral("/.")))
-            continue;
-
-        m_notePaths.append(relative);
-    }
-
-    std::sort(m_notePaths.begin(), m_notePaths.end(), [](const QString &a, const QString &b) {
-        const QString aName = QFileInfo(a).completeBaseName();
-        const QString bName = QFileInfo(b).completeBaseName();
-        const int byName = aName.compare(bName, Qt::CaseInsensitive);
-        return byName != 0 ? byName < 0 : a.compare(b, Qt::CaseInsensitive) < 0;
-    });
-
-    // One head read per note, so the link tree and future panels never scan
-    // the vault again for what the index already knows.
-    for (const QString &path : m_notePaths)
-        m_noteMeta.insert(path, readNoteFrontmatter(root.filePath(path)));
+void Backend::invalidateNoteIndex() {
+    m_noteIndex.invalidate();
 }
 
 QVariantList Backend::noteSuggestions(const QString &query) {
-    if (!m_notesIndexed || m_notesRoot != notesRoot())
-        refreshNoteIndex();
-
-    QHash<QString, int> nameCounts;
-    for (const QString &path : m_notePaths)
-        ++nameCounts[QFileInfo(path).completeBaseName().toCaseFolded()];
-
-    const QString needle = query.trimmed().toCaseFolded();
-    struct Suggestion {
-        QString path;
-        QString name;
-        QString insert;
-        int score;
-    };
-    QList<Suggestion> matches;
-    for (const QString &path : m_notePaths) {
-        const QString name = QFileInfo(path).completeBaseName();
-        int score = 0;
-        if (!needle.isEmpty()) {
-            const int nameAt = name.toCaseFolded().indexOf(needle);
-            const int pathAt = path.toCaseFolded().indexOf(needle);
-            if (nameAt < 0 && pathAt < 0)
-                continue;
-            score = nameAt >= 0 ? nameAt : 1000 + pathAt;
-        }
-        QString stem = path;
-        const int slash = stem.lastIndexOf(QLatin1Char('/'));
-        const int dot = stem.lastIndexOf(QLatin1Char('.'));
-        if (dot > slash)
-            stem.truncate(dot);
-        const bool duplicate = nameCounts.value(name.toCaseFolded()) > 1;
-        const QString insert = duplicate && stem.contains(QLatin1Char('/')) ? stem : name;
-        matches.append({path, name, insert, score});
-    }
-
-    std::sort(matches.begin(), matches.end(), [](const Suggestion &a, const Suggestion &b) {
-        if (a.score != b.score)
-            return a.score < b.score;
-        const int byName = a.name.compare(b.name, Qt::CaseInsensitive);
-        return byName != 0 ? byName < 0 : a.path.compare(b.path, Qt::CaseInsensitive) < 0;
-    });
-
-    QVariantList suggestions;
-    const int limit = 50;
-    for (int i = 0; i < matches.size() && i < limit; ++i) {
-        suggestions.append(QVariantMap{
-            {QStringLiteral("name"), matches[i].name},
-            {QStringLiteral("path"), matches[i].path},
-            {QStringLiteral("insert"), matches[i].insert},
-            {QStringLiteral("url"),
-             QUrl::fromLocalFile(QDir(m_notesRoot).filePath(matches[i].path))}});
-    }
-    return suggestions;
-}
-
-// A frontmatter value with its quotes dropped. For up: links the brackets,
-// aliases, and headings come off too, leaving the bare note target.
-static QString cleanFrontmatterValue(QString value, bool link) {
-    value = value.trimmed();
-    if (value.size() >= 2
-            && ((value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"')))
-                || (value.startsWith(QLatin1Char('\'')) && value.endsWith(QLatin1Char('\'')))))
-        value = value.mid(1, value.size() - 2).trimmed();
-    if (!link)
-        return value;
-    if (value.startsWith(QStringLiteral("[["))) {
-        const int close = value.indexOf(QStringLiteral("]]"));
-        if (close > 2)
-            value = value.mid(2, close - 2);
-    }
-    const int alias = value.indexOf(QLatin1Char('|'));
-    if (alias >= 0)
-        value.truncate(alias);
-    const int heading = value.indexOf(QLatin1Char('#'));
-    if (heading >= 0)
-        value.truncate(heading);
-    return value.trimmed();
-}
-
-// The top-level up: and tags:/tag: keys of a note's frontmatter. Only the
-// head of the file is read: the block always opens the note, and a vault-wide
-// index cannot afford whole files. A mapping under up: (an object, not
-// parents) is left alone rather than guessed at.
-Backend::NoteMeta Backend::readNoteFrontmatter(const QString &absolutePath) {
-    NoteMeta meta;
-    QFile file(absolutePath);
-    if (!file.open(QIODevice::ReadOnly))
-        return meta;
-    const QList<QByteArray> lines = file.read(4096).split('\n');
-    if (lines.isEmpty() || lines.constFirst().trimmed() != "---")
-        return meta;
-    int end = -1;
-    for (int i = 1; i < lines.size(); ++i) {
-        const QByteArray trimmed = lines.at(i).trimmed();
-        if (trimmed == "---" || trimmed == "...") {
-            end = i;
-            break;
-        }
-    }
-    if (end < 0)
-        return meta;
-
-    for (int i = 1; i < end;) {
-        const QString line = QString::fromUtf8(lines.at(i));
-        if (line.isEmpty() || line.at(0).isSpace() || !line.contains(QLatin1Char(':'))) {
-            ++i;
-            continue;
-        }
-        const QString key = line.left(line.indexOf(QLatin1Char(':'))).trimmed();
-        const bool isUp = key == QStringLiteral("up");
-        if (!isUp && key != QStringLiteral("tags") && key != QStringLiteral("tag")) {
-            ++i;
-            continue;
-        }
-        const QString rest = line.mid(line.indexOf(QLatin1Char(':')) + 1).trimmed();
-        QStringList *out = isUp ? &meta.ups : &meta.tags;
-        if (rest.isEmpty()) {
-            // A block list: the indented "- item" lines that follow the key.
-            // Anything else (a nested mapping's "key: value") ends it.
-            ++i;
-            while (i < end) {
-                const QString item = QString::fromUtf8(lines.at(i)).trimmed();
-                if (!item.startsWith(QLatin1Char('-')))
-                    break;
-                const QString value = cleanFrontmatterValue(item.mid(1), isUp);
-                if (!value.isEmpty())
-                    out->append(value);
-                ++i;
-            }
-            continue;
-        }
-        if (isUp && rest.startsWith(QLatin1Char('{'))) {
-            ++i;
-            continue;
-        }
-        if (rest.startsWith(QLatin1Char('['))) {
-            QString flow = rest.mid(1);
-            if (flow.endsWith(QLatin1Char(']')))
-                flow.chop(1);
-            for (const QString &part : flow.split(QLatin1Char(','))) {
-                const QString value = cleanFrontmatterValue(part, isUp);
-                if (!value.isEmpty())
-                    out->append(value);
-            }
-            ++i;
-            continue;
-        }
-        const QString value = cleanFrontmatterValue(rest, isUp);
-        if (!value.isEmpty())
-            out->append(value);
-        ++i;
-    }
-    return meta;
+    refreshNoteIndex();
+    return m_noteIndex.suggestions(query);
 }
 
 QString Backend::fullDocumentText() const {
@@ -1683,61 +1517,9 @@ bool Backend::removePropertyValue(const QString &key, const QString &value) {
 }
 
 QVariantMap Backend::noteFrontmatter(const QString &relativePath) {
-    if (!m_notesIndexed || m_notesRoot != notesRoot())
-        refreshNoteIndex();
-    const NoteMeta meta = m_noteMeta.value(relativePath);
+    refreshNoteIndex();
+    const NoteIndex::NoteMeta meta = m_noteIndex.meta(relativePath);
     return QVariantMap{{QStringLiteral("ups"), meta.ups}, {QStringLiteral("tags"), meta.tags}};
-}
-
-// Where an up: target points, as an index-relative path. Beside the source
-// note wins, then the vault root, then a name unique across the vault — the
-// same order [[ links resolve in — so the tree nests notes where following
-// their links would land.
-QString Backend::resolveUpTarget(const QString &target, const QString &sourceDir) const {
-    QString name = target.trimmed();
-    if (name.isEmpty())
-        return {};
-
-    const int heading = name.indexOf(QLatin1Char('#'));
-    if (heading >= 0)
-        name.truncate(heading);
-    name = name.trimmed();
-    if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
-        name.chop(9);
-    else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
-        name.chop(3);
-    if (name.isEmpty() || name.contains(QStringLiteral(".."))
-            || QDir::isAbsolutePath(name))
-        return {};
-
-    const QDir root(m_notesRoot);
-    const QStringList suffixes{QStringLiteral(".md"), QStringLiteral(".markdown")};
-    for (const QString &suffix : suffixes) {
-        const QFileInfo beside(QDir(sourceDir).filePath(name + suffix));
-        if (!beside.isFile())
-            continue;
-        const QString relative = root.relativeFilePath(beside.canonicalFilePath());
-        if (!relative.startsWith(QStringLiteral("..")))
-            return relative;
-    }
-    for (const QString &suffix : suffixes) {
-        const QFileInfo atRoot(root.filePath(name + suffix));
-        if (atRoot.isFile())
-            return root.relativeFilePath(atRoot.canonicalFilePath());
-    }
-
-    const QString wanted = QFileInfo(name).fileName();
-    QString match;
-    for (const QString &path : m_notePaths) {
-        if (QFileInfo(path).completeBaseName().compare(wanted, Qt::CaseInsensitive) != 0)
-            continue;
-        // Two notes sharing a bare name leave the parent unresolved instead
-        // of nesting under the wrong one.
-        if (!match.isEmpty() && match != path)
-            return {};
-        match = path;
-    }
-    return match;
 }
 
 // Generated exports, not knowledge notes: they bulk up the hierarchy without
@@ -1748,13 +1530,14 @@ static bool excludedFromVirtTree(const QString &relativePath) {
 }
 
 QVariantList Backend::virtFolderTree() {
-    if (!m_notesIndexed || m_notesRoot != notesRoot())
-        refreshNoteIndex();
+    refreshNoteIndex();
     QVariantList tree;
-    if (m_notesRoot.isEmpty())
+    const QString vaultPath = m_vault.root();
+    if (vaultPath.isEmpty())
         return tree;
 
-    const QDir root(m_notesRoot);
+    const QDir root(vaultPath);
+    const QStringList knownNotes = m_noteIndex.paths();
     const auto byName = [](const QString &a, const QString &b) {
         const int name = QFileInfo(a).completeBaseName().compare(
             QFileInfo(b).completeBaseName(), Qt::CaseInsensitive);
@@ -1763,17 +1546,17 @@ QVariantList Backend::virtFolderTree() {
 
     QHash<QString, QStringList> childrenOf;
     QSet<QString> hasParent;
-    for (const QString &path : m_notePaths) {
-        if (excludedFromVirtTree(path))
+    for (const NoteIndex::Entry &entry : m_noteIndex.entries()) {
+        if (excludedFromVirtTree(entry.path))
             continue;
-        const QString sourceDir = root.filePath(QFileInfo(path).path());
-        for (const QString &up : m_noteMeta.value(path).ups) {
-            const QString parent = resolveUpTarget(up, sourceDir);
-            if (parent.isEmpty() || parent == path || excludedFromVirtTree(parent))
+        const QString sourceDir = root.filePath(QFileInfo(entry.path).path());
+        for (const QString &up : entry.meta.ups) {
+            const QString parent = m_vault.resolveNote(up, sourceDir, knownNotes);
+            if (parent.isEmpty() || parent == entry.path || excludedFromVirtTree(parent))
                 continue;
-            if (!childrenOf[parent].contains(path))
-                childrenOf[parent].append(path);
-            hasParent.insert(path);
+            if (!childrenOf[parent].contains(entry.path))
+                childrenOf[parent].append(entry.path);
+            hasParent.insert(entry.path);
         }
     }
     for (auto it = childrenOf.begin(); it != childrenOf.end(); ++it)
@@ -1795,7 +1578,7 @@ QVariantList Backend::virtFolderTree() {
                 {QStringLiteral("name"), QFileInfo(path).completeBaseName()},
                 {QStringLiteral("path"), path},
                 {QStringLiteral("url"), QUrl::fromLocalFile(root.filePath(path))},
-                {QStringLiteral("tags"), m_noteMeta.value(path).tags},
+                {QStringLiteral("tags"), m_noteIndex.meta(path).tags},
                 {QStringLiteral("childCount"), childrenOf.value(path).size()},
                 {QStringLiteral("children"), kids}};
         };
@@ -1803,9 +1586,9 @@ QVariantList Backend::virtFolderTree() {
     // A note whose parents resolve nests under each of them; anything without
     // one — orphans included — stays a root, like VirtFolder shows them.
     QStringList roots;
-    for (const QString &path : m_notePaths) {
-        if (!excludedFromVirtTree(path) && !hasParent.contains(path))
-            roots.append(path);
+    for (const NoteIndex::Entry &entry : m_noteIndex.entries()) {
+        if (!excludedFromVirtTree(entry.path) && !hasParent.contains(entry.path))
+            roots.append(entry.path);
     }
     std::sort(roots.begin(), roots.end(), byName);
 
@@ -1824,252 +1607,46 @@ QVariantList Backend::virtFolderTree() {
         placed.insert(path);
     }
     // A pure cycle has no roots at all; lift its members up so no note hides.
-    for (const QString &path : m_notePaths) {
-        if (!excludedFromVirtTree(path) && !placed.contains(path)) {
-            tree.append(build(path, QSet<QString>()));
+    for (const NoteIndex::Entry &entry : m_noteIndex.entries()) {
+        if (!excludedFromVirtTree(entry.path) && !placed.contains(entry.path)) {
+            tree.append(build(entry.path, QSet<QString>()));
             markPlaced(tree.constLast().toMap().value(QStringLiteral("children")).toList());
-            placed.insert(path);
+            placed.insert(entry.path);
         }
     }
     return tree;
 }
 
 QString Backend::fileTreeRoot() const {
-    const QString root = notesRoot();
-    return root.isEmpty() ? QDir::homePath() : root;
+    return m_vault.treeRoot();
 }
 
 QVariantList Backend::listFolder(const QString &relativePath) const {
-    if (relativePath.contains(QStringLiteral("..")) || QDir::isAbsolutePath(relativePath))
-        return {};
-
-    const QDir root(fileTreeRoot());
-    const QDir folder(relativePath.isEmpty() ? root.path() : root.filePath(relativePath));
-    const QFileInfoList entries = folder.entryInfoList(
-        {QStringLiteral("*")}, QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot,
-        QDir::DirsFirst | QDir::IgnoreCase | QDir::Name);
-
-    QVariantList rows;
-    for (const QFileInfo &entry : entries) {
-        const QString name = entry.fileName();
-        if (name.startsWith(QLatin1Char('.')))
-            continue;
-        const bool isDir = entry.isDir();
-        const QString suffix = entry.suffix().toLower();
-        if (!isDir && suffix != QStringLiteral("md") && suffix != QStringLiteral("markdown"))
-            continue;
-        rows.append(QVariantMap{
-            {QStringLiteral("name"), isDir ? name : entry.completeBaseName()},
-            {QStringLiteral("path"), root.relativeFilePath(entry.absoluteFilePath())},
-            {QStringLiteral("url"), QUrl::fromLocalFile(entry.absoluteFilePath())},
-            {QStringLiteral("isDir"), isDir}});
-    }
-    return rows;
+    return m_vault.listFolder(relativePath);
 }
 
 QString Backend::fileTreeCurrentPath() const {
-    if (!m_fileUrl.isLocalFile())
-        return {};
-    const QString relative =
-        QDir(fileTreeRoot()).relativeFilePath(QFileInfo(m_fileUrl.toLocalFile()).absoluteFilePath());
-    return relative.startsWith(QStringLiteral("..")) ? QString() : relative;
+    return m_fileUrl.isLocalFile()
+        ? m_vault.treeRelativePath(m_fileUrl.toLocalFile()) : QString();
 }
 
 QVariantList Backend::backlinks() {
     if (!m_fileUrl.isLocalFile())
         return {};
-    if (!m_notesIndexed || m_notesRoot != notesRoot())
-        refreshNoteIndex();
-    if (m_notesRoot.isEmpty())
-        return {};
-
-    const QDir root(m_notesRoot);
-    const QString currentPath = QFileInfo(m_fileUrl.toLocalFile()).canonicalFilePath();
-    const QString currentRelative = root.relativeFilePath(currentPath);
-    if (currentRelative.startsWith(QStringLiteral("..")))
-        return {};
-    const QString currentName = QFileInfo(currentRelative).completeBaseName();
-    const QString currentDir = QFileInfo(currentPath).absolutePath();
-
-    QString currentStem = currentRelative;
-    const int dot = currentStem.lastIndexOf(QLatin1Char('.'));
-    if (dot > currentStem.lastIndexOf(QLatin1Char('/')))
-        currentStem.truncate(dot);
-    currentStem = currentStem.toCaseFolded();
-
-    QHash<QString, int> nameCounts;
-    for (const QString &path : m_notePaths)
-        ++nameCounts[QFileInfo(path).completeBaseName().toCaseFolded()];
-    const QString foldedName = currentName.toCaseFolded();
-    // A bare [[name]] reaches a note beside the one holding it, at the vault
-    // root, or anywhere when no other note shares the name; resolveNote
-    // follows the same order.
-    const bool bareNameIsUnique = nameCounts.value(foldedName) <= 1;
-    const bool atRoot = !currentStem.contains(QLatin1Char('/'));
-
-    const auto stripExtension = [](QString name) {
-        if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
-            name.chop(9);
-        else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
-            name.chop(3);
-        return name;
-    };
-    // Whether a link written in the note at sourceDir points at the open one.
-    const auto pointsHere = [&](QString target, const QString &sourceDir) {
-        const int heading = target.indexOf(QLatin1Char('#'));
-        if (heading >= 0)
-            target.truncate(heading);
-        target = stripExtension(target.trimmed()).toCaseFolded();
-        if (target.isEmpty())
-            return false;
-        if (!target.contains(QLatin1Char('/')))
-            return target == foldedName
-                && (bareNameIsUnique || atRoot || sourceDir == currentDir);
-        if (target == currentStem)
-            return true;
-        const QString relativeToSource =
-            root.relativeFilePath(QDir(sourceDir).filePath(target)).toCaseFolded();
-        return relativeToSource == currentStem;
-    };
-
-    static const QRegularExpression wikiRe(QStringLiteral("\\[\\[([^\\]\\n]+)\\]\\]"));
-    static const QRegularExpression markdownLinkRe(
-        QStringLiteral("\\[[^\\]\\n]*\\]\\(\\s*(?:<([^>\\n]+)>|([^\\s()<>]+))[^)\\n]*\\)"));
-    static const QRegularExpression fenceRe(QStringLiteral("^\\s{0,3}(```|~~~)"));
-
-    QVariantList sources;
-    for (const QString &path : m_notePaths) {
-        if (path == currentRelative)
-            continue;
-        QFile file(root.filePath(path));
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-            continue;
-        const QString text = QString::fromUtf8(file.readAll());
-        // Cheap rejection: a link has to spell the note's name somewhere.
-        if (!text.contains(currentName, Qt::CaseInsensitive))
-            continue;
-
-        const QString sourceDir = QFileInfo(root.filePath(path)).absolutePath();
-        QVariantList mentions;
-        bool inFence = false;
-        int lineNumber = 0;
-        for (const QStringView line : QStringView(text).split(QLatin1Char('\n'))) {
-            ++lineNumber;
-            const QString lineText = line.toString();
-            if (fenceRe.match(lineText).hasMatch()) {
-                inFence = !inFence;
-                continue;
-            }
-            if (inFence)
-                continue;
-
-            bool linked = false;
-            QRegularExpressionMatchIterator wiki = wikiRe.globalMatch(lineText);
-            while (wiki.hasNext() && !linked) {
-                QString target = wiki.next().captured(1);
-                const int pipe = target.indexOf(QLatin1Char('|'));
-                if (pipe >= 0)
-                    target.truncate(pipe);
-                linked = pointsHere(target, sourceDir);
-            }
-            QRegularExpressionMatchIterator markdown = markdownLinkRe.globalMatch(lineText);
-            while (markdown.hasNext() && !linked) {
-                const QRegularExpressionMatch match = markdown.next();
-                const QString destination = QUrl::fromPercentEncoding(
-                    (match.capturedStart(1) >= 0 ? match.captured(1) : match.captured(2))
-                        .toUtf8());
-                if (destination.contains(QStringLiteral("://"))
-                        || !(destination.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive)
-                             || destination.contains(QStringLiteral(".md#"), Qt::CaseInsensitive)
-                             || destination.endsWith(QStringLiteral(".markdown"),
-                                                     Qt::CaseInsensitive)))
-                    continue;
-                // Markdown links are paths from the note holding them.
-                QString relative = destination.left(destination.indexOf(QLatin1Char('#')) < 0
-                                                        ? destination.size()
-                                                        : destination.indexOf(QLatin1Char('#')));
-                relative = QDir::cleanPath(QDir(sourceDir).filePath(relative));
-                linked = QFileInfo(relative).canonicalFilePath() == currentPath;
-            }
-            if (!linked)
-                continue;
-
-            QString shown = lineText.trimmed();
-            if (shown.size() > 240)
-                shown = shown.left(240) + QStringLiteral("…");
-            mentions.append(QVariantMap{{QStringLiteral("line"), lineNumber},
-                                        {QStringLiteral("text"), shown}});
-        }
-        if (mentions.isEmpty())
-            continue;
-
-        sources.append(QVariantMap{
-            {QStringLiteral("name"), QFileInfo(path).completeBaseName()},
-            {QStringLiteral("path"), path},
-            {QStringLiteral("url"), QUrl::fromLocalFile(root.filePath(path))},
-            {QStringLiteral("count"), int(mentions.size())},
-            {QStringLiteral("mentions"), mentions}});
-    }
-    // m_notePaths is already sorted by name, so the sources are too.
-    return sources;
+    refreshNoteIndex();
+    return m_noteIndex.backlinks(m_vault.relativePath(m_fileUrl.toLocalFile()));
 }
 
-QUrl Backend::resolveNote(const QString &target) const {
-    QString name = target.trimmed();
-    if (name.isEmpty())
+QUrl Backend::resolveNote(const QString &target) {
+    refreshNoteIndex();
+    const QString relative =
+        m_vault.resolveNote(target, m_vault.sourceDirectory(), m_noteIndex.paths());
+    if (relative.isEmpty())
         return {};
-
-    const int heading = name.indexOf(QLatin1Char('#'));
-    if (heading >= 0)
-        name.truncate(heading);
-    name = name.trimmed();
-    if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
-        name.chop(9);
-    else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
-        name.chop(3);
-    if (name.isEmpty() || name.contains(QStringLiteral(".."))
-            || QDir::isAbsolutePath(name))
-        return {};
-
-    const QStringList suffixes{QStringLiteral(".md"), QStringLiteral(".markdown")};
-    const QDir current = m_fileUrl.isLocalFile()
-        ? QFileInfo(m_fileUrl.toLocalFile()).absoluteDir()
-        : QDir(notesRoot());
-    for (const QString &suffix : suffixes) {
-        const QFileInfo beside(current.filePath(name + suffix));
-        if (beside.exists() && beside.isFile())
-            return QUrl::fromLocalFile(beside.canonicalFilePath());
-    }
-
-    const QString root = notesRoot();
-    if (root.isEmpty())
-        return {};
-    for (const QString &suffix : suffixes) {
-        const QFileInfo atRoot(QDir(root).filePath(name + suffix));
-        if (atRoot.exists() && atRoot.isFile())
-            return QUrl::fromLocalFile(atRoot.canonicalFilePath());
-    }
-
-    // Obsidian resolves a bare name anywhere in the vault. Ambiguity is not
-    // guessed at: two notes with the same name leave the link unresolved.
-    const QString wanted = QFileInfo(name).fileName();
-    QString match;
-    QDirIterator iterator(root, {QStringLiteral("*.md"), QStringLiteral("*.markdown")},
-                          QDir::Files, QDirIterator::Subdirectories);
-    while (iterator.hasNext()) {
-        iterator.next();
-        if (QFileInfo(iterator.fileName()).completeBaseName().compare(wanted,
-                                                                      Qt::CaseInsensitive) != 0)
-            continue;
-        const QString candidate = iterator.fileInfo().canonicalFilePath();
-        if (!match.isEmpty() && match != candidate)
-            return {};
-        match = candidate;
-    }
-    return match.isEmpty() ? QUrl() : QUrl::fromLocalFile(match);
+    return QUrl::fromLocalFile(m_vault.absolutePath(relative));
 }
 
-QVariantMap Backend::wikiLinkAt(int position) const {
+QVariantMap Backend::wikiLinkAt(int position) {
     const QVariantMap none{{QStringLiteral("kind"), QStringLiteral("none")}};
     if (!m_document)
         return none;
@@ -2099,37 +1676,10 @@ void Backend::reportMissingNote(const QString &target) {
     setStatus(QStringLiteral("No note named %1").arg(target));
 }
 
-// Where a pasted image goes. In an Obsidian vault that is the vault's own
-// attachment folder setting, so Obsidian finds what Omawrite pastes:
-// "/" or unset is the vault root, "./x" sits beside the note, and anything
-// else is a folder in the vault. Elsewhere it is _attachments beside the
-// document, and an untitled one outside a vault has no folder yet.
+// Where a pasted image goes: the vault's own attachment setting in an
+// Obsidian vault, or _attachments beside a plain note. Vault owns both rules.
 QString Backend::attachmentDirectory(bool *vault) const {
-    const QString root = notesRoot();
-    const bool isVault = !root.isEmpty()
-        && QDir(QDir(root).filePath(QStringLiteral(".obsidian"))).exists();
-    if (vault)
-        *vault = isVault;
-    const QString documentDir = m_fileUrl.isLocalFile()
-        ? QFileInfo(m_fileUrl.toLocalFile()).absolutePath() : QString();
-
-    if (!isVault)
-        return documentDir.isEmpty()
-            ? QString() : QDir(documentDir).filePath(QStringLiteral("_attachments"));
-
-    QString setting;
-    QFile appConfig(QDir(root).filePath(QStringLiteral(".obsidian/app.json")));
-    if (appConfig.open(QIODevice::ReadOnly)) {
-        setting = QJsonDocument::fromJson(appConfig.readAll()).object()
-                      .value(QStringLiteral("attachmentFolderPath")).toString().trimmed();
-    }
-    if (setting.isEmpty() || setting == QStringLiteral("/"))
-        return root;
-    if (setting == QStringLiteral(".") || setting.startsWith(QStringLiteral("./"))) {
-        const QString base = documentDir.isEmpty() ? root : documentDir;
-        return QDir::cleanPath(base + QLatin1Char('/') + setting.mid(1));
-    }
-    return QDir::cleanPath(root + QLatin1Char('/') + setting);
+    return m_vault.attachmentDirectory(vault);
 }
 
 // A file name in folder that is not taken yet: "name.png", then "name 1.png".
@@ -2182,7 +1732,7 @@ QVariantMap Backend::pasteClipboardImage() {
         return handledNothing;
     }
     const QDir folder(folderPath);
-    const QString root = notesRoot();
+    const QString root = m_vault.root();
 
     QStringList written;
     if (imageData) {
@@ -2262,7 +1812,7 @@ QString Backend::resolveImage(const QString &target, bool wiki) const {
         const QFileInfo info(path);
         return info.isFile() ? info.absoluteFilePath() : QString();
     };
-    const QString root = notesRoot();
+    const QString root = m_vault.root();
     const QString base = documentDir.isEmpty() ? root : documentDir;
     QString found;
 
@@ -2640,8 +2190,25 @@ void Backend::setFileUrl(const QUrl &url) {
     if (m_fileUrl == url)
         return;
 
+    const QString previousVaultRoot = m_vault.root();
+    const QString previousTreeRoot = fileTreeRoot();
+    const QString previousPath = fileTreeCurrentPath();
+
     m_fileUrl = url;
+    m_vault.setNoteFile(url.isLocalFile() ? url.toLocalFile() : QString());
     m_imagePaths.clear();
+
+    if (previousVaultRoot != m_vault.root())
+        emit vaultRootChanged();
+    if (previousTreeRoot != fileTreeRoot())
+        emit fileTreeRootChanged();
+    if (previousPath != fileTreeCurrentPath())
+        emit fileTreeCurrentPathChanged();
+
+    // A note in a new folder may sit in another vault: warm that vault's
+    // snapshot now. Inside the same vault this is a no-op, so a tab switch
+    // never walks the notes again.
+    refreshNoteIndex();
     emit fileUrlChanged();
 }
 
@@ -2700,8 +2267,12 @@ void Backend::saveTo(const QUrl &url) {
     m_autoSaveTimer.stop();
     setFileUrl(url);
     watchCurrentFile();
-    QSettings().setValue(lastSaveDirectorySetting,
-                         QFileInfo(url.toLocalFile()).absolutePath());
+    const QString savedFolder = QFileInfo(url.toLocalFile()).absolutePath();
+    QSettings().setValue(lastSaveDirectorySetting, savedFolder);
+    // The saved note's own tags and parents may have changed; update just
+    // that entry rather than invalidating the whole snapshot. A note that is
+    // new to the snapshot asks for a full refresh instead.
+    m_noteIndex.noteSaved(m_vault.relativePath(url.toLocalFile()));
     setModified(false);
     setStatus(QStringLiteral("Saved %1").arg(fileName()));
     clearRecovery();
@@ -2775,6 +2346,9 @@ void Backend::reportExternalChange(bool deleted) {
     // text is not saved anywhere either.
     setKnownFileContents(QByteArray(), false);
     suspendAutoSave();
+    // The file's own frontmatter may be what changed, and backlinks or the
+    // link tree would still be drawing the old one.
+    m_noteIndex.invalidate();
     emit externalChangeDetected(deleted, m_modified);
 }
 

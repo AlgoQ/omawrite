@@ -28,6 +28,8 @@
 
 #include "backend.h"
 #include "markdownhighlighter.h"
+#include "noteindex.h"
+#include "vault.h"
 
 // Counts QML "Binding loop detected" warnings while it is alive, forwarding
 // everything to the previous handler so test output stays intact.
@@ -478,6 +480,383 @@ private slots:
         QCOMPARE(plain.value(QStringLiteral("count")).toInt(), 1);
         QCOMPARE(plain.value(QStringLiteral("mentions")).toList().constFirst().toMap()
                      .value(QStringLiteral("line")).toInt(), 1);
+    }
+
+    void vaultFindsItsRootsNotesAndAttachments() {
+        QTemporaryDir vaultDirectory;
+        QVERIFY(vaultDirectory.isValid());
+        QDir root(vaultDirectory.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("ai/deep")));
+        QVERIFY(root.mkpath(QStringLiteral("one")));
+        QVERIFY(root.mkpath(QStringLiteral("two")));
+        QVERIFY(root.mkpath(QStringLiteral("sub")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Top.md"), "# Top\n"));
+        QVERIFY(write(QStringLiteral("ai/deep/Sibling.md"), "# Sibling\n"));
+        QVERIFY(write(QStringLiteral("ai/deep/Note.md"), "# Note\n"));
+        QVERIFY(write(QStringLiteral("sub/Deep.md"), "# Deep\n"));
+        QVERIFY(write(QStringLiteral("one/Shared.md"), "# One\n"));
+        QVERIFY(write(QStringLiteral("two/Shared.md"), "# Two\n"));
+        QVERIFY(write(QStringLiteral(".obsidian/app.json"),
+                      "{\"attachmentFolderPath\": \"attachments\"}\n"));
+
+        const QString notePath = root.filePath(QStringLiteral("ai/deep/Note.md"));
+        Vault vault;
+        vault.setNoteFile(notePath);
+        QCOMPARE(vault.root(), root.absolutePath());
+        QVERIFY(vault.isObsidianVault());
+        QCOMPARE(vault.treeRoot(), root.absolutePath());
+        QVERIFY(vault.contains(notePath));
+        QVERIFY(!vault.contains(QDir::tempPath()));
+        QCOMPARE(vault.relativePath(notePath), QStringLiteral("ai/deep/Note.md"));
+        QCOMPARE(vault.treeRelativePath(notePath), QStringLiteral("ai/deep/Note.md"));
+        QCOMPARE(vault.sourceDirectory(), root.filePath(QStringLiteral("ai/deep")));
+        QCOMPARE(vault.documentFolder(), root.filePath(QStringLiteral("ai/deep")));
+
+        const QString sourceDir = root.filePath(QStringLiteral("ai/deep"));
+        const QStringList notes{QStringLiteral("Top.md"), QStringLiteral("sub/Deep.md"),
+                                QStringLiteral("ai/deep/Sibling.md"),
+                                QStringLiteral("one/Shared.md"), QStringLiteral("two/Shared.md")};
+        QCOMPARE(vault.resolveNote(QStringLiteral("Sibling"), sourceDir, notes),
+                 QStringLiteral("ai/deep/Sibling.md"));
+        QCOMPARE(vault.resolveNote(QStringLiteral("Top"), sourceDir, notes),
+                 QStringLiteral("Top.md"));
+        QCOMPARE(vault.resolveNote(QStringLiteral("sub/Deep.md"), sourceDir, notes),
+                 QStringLiteral("sub/Deep.md"));
+        QVERIFY(vault.resolveNote(QStringLiteral("Shared"), sourceDir, notes).isEmpty());
+
+        bool isVault = false;
+        QCOMPARE(vault.attachmentDirectory(&isVault),
+                 root.filePath(QStringLiteral("attachments")));
+        QVERIFY(isVault);
+        QVERIFY(write(QStringLiteral(".obsidian/app.json"),
+                      "{\"attachmentFolderPath\": \"./_attachments\"}\n"));
+        QCOMPARE(vault.attachmentDirectory(nullptr),
+                 root.filePath(QStringLiteral("ai/deep/_attachments")));
+        QVERIFY(write(QStringLiteral(".obsidian/app.json"),
+                      "{\"attachmentFolderPath\": \"/\"}\n"));
+        QCOMPARE(vault.attachmentDirectory(nullptr), root.absolutePath());
+
+        // A plain folder is its own root, and pasted images sit beside the
+        // note; an untitled document outside a vault has no folder yet.
+        QTemporaryDir plainDirectory;
+        QVERIFY(plainDirectory.isValid());
+        QDir plainRoot(plainDirectory.path());
+        QVERIFY(plainRoot.mkpath(QStringLiteral("nested")));
+        const QString plainNote = plainRoot.filePath(QStringLiteral("nested/Plain.md"));
+        QFile plainFile(plainNote);
+        QVERIFY(plainFile.open(QIODevice::WriteOnly));
+        plainFile.write("# Plain\n");
+        plainFile.close();
+
+        Vault plain;
+        plain.setNoteFile(plainNote);
+        QCOMPARE(plain.root(), plainRoot.filePath(QStringLiteral("nested")));
+        QVERIFY(!plain.isObsidianVault());
+        QVERIFY(plain.contains(plainNote));
+        QCOMPARE(plain.resolveNote(QStringLiteral("Plain"), plain.sourceDirectory(),
+                                   QStringList{QStringLiteral("nested/Plain.md")}),
+                 QStringLiteral("Plain.md"));
+        QCOMPARE(plain.attachmentDirectory(nullptr),
+                 plainRoot.filePath(QStringLiteral("nested/_attachments")));
+
+        Vault untitled;
+        untitled.setFallbackFolder(plainRoot.absolutePath());
+        QCOMPARE(untitled.root(), plainRoot.absolutePath());
+        QVERIFY(untitled.attachmentDirectory(nullptr).isEmpty());
+    }
+
+    void indexStaysWarmUntilInvalidated() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("First.md"), "---\ntags:\n  - warm\n---\n# First\n"));
+
+        NoteIndex index;
+        QVERIFY(index.refresh(root.absolutePath()));
+        QCOMPARE(index.entries().size(), 1);
+        QCOMPARE(index.meta(QStringLiteral("First.md")).tags,
+                 (QStringList{QStringLiteral("warm")}));
+
+        // A clean snapshot answers without reading the folder again: the
+        // note added behind its back is not there until something says so.
+        QVERIFY(write(QStringLiteral("Second.md"), "# Second\n"));
+        QVERIFY(!index.refresh(root.absolutePath()));
+        QCOMPARE(index.entries().size(), 1);
+
+        index.invalidate();
+        QVERIFY(index.refresh(root.absolutePath()));
+        QCOMPARE(index.entries().size(), 2);
+        QCOMPARE(index.entries().constLast().path, QStringLiteral("Second.md"));
+        QCOMPARE(index.suggestions(QStringLiteral("second")).size(), 1);
+    }
+
+    void indexSuggestsAndFindsBacklinksAfterSavesAndMoves() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Target.md"), "# Target\n"));
+        QVERIFY(write(QStringLiteral("Source.md"), "see [[Target]]\n"));
+        QVERIFY(write(QStringLiteral("Other.md"), "# Other\n"));
+
+        Backend backend;
+        QQuickTextDocument *document = attachTextEdit(&backend);
+        QVERIFY(document);
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Source.md"))));
+        QCOMPARE(backend.vaultRoot(), root.absolutePath());
+        QCOMPARE(backend.noteSuggestions(QStringLiteral("Target")).size(), 1);
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Target.md"))));
+        QCOMPARE(backend.backlinks().size(), 1);
+
+        // Saving a link makes the index notice it: backlinks read the same
+        // snapshot the tree and [[ suggestions do.
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Other.md"))));
+        document->textDocument()->setPlainText(QStringLiteral("[[Target]]\n"));
+        backend.save();
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Target.md"))));
+        QCOMPARE(backend.backlinks().size(), 2);
+
+        // A note saved into the vault joins the snapshot without a restart.
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Other.md"))));
+        document->textDocument()->setPlainText(QStringLiteral("[[Target]]\n"));
+        backend.saveAs(QUrl::fromLocalFile(root.filePath(QStringLiteral("Fresh.md"))));
+        const QVariantList fresh = backend.noteSuggestions(QStringLiteral("Fresh"));
+        QCOMPARE(fresh.size(), 1);
+        QCOMPARE(fresh.constFirst().toMap().value(QStringLiteral("path")).toString(),
+                 QStringLiteral("Fresh.md"));
+
+        // A move outside Omawrite reaches the watcher, and every reader of
+        // the snapshot follows it.
+        QVERIFY(root.mkpath(QStringLiteral("sub")));
+        QVERIFY(QFile::rename(root.filePath(QStringLiteral("Target.md")),
+                              root.filePath(QStringLiteral("sub/Target.md"))));
+        const QUrl moved = QUrl::fromLocalFile(root.filePath(QStringLiteral("sub/Target.md")));
+        QTRY_COMPARE(backend.resolveNote(QStringLiteral("Target")), moved);
+        const QVariantList targets = backend.noteSuggestions(QStringLiteral("Target"));
+        QCOMPARE(targets.size(), 1);
+        QCOMPARE(targets.constFirst().toMap().value(QStringLiteral("path")).toString(),
+                 QStringLiteral("sub/Target.md"));
+
+        backend.open(moved);
+        QCOMPARE(backend.backlinks().size(), 3);
+    }
+
+    void treeNoteRowsOpenAndChevronsFold() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Parent.md"), "# Parent\n"));
+        QVERIFY(write(QStringLiteral("Child.md"),
+                      "---\nup:\n  - \"[[Parent]]\"\n---\n# Child\n"));
+        QVERIFY(write(QStringLiteral("Other.md"), "# Other\n"));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Other.md"))));
+        QObject *list = window->findChild<QObject *>(QStringLiteral("fileViewerList"));
+        QVERIFY(list);
+        // Other and Parent are roots; Parent's child starts folded.
+        QTRY_COMPARE(list->property("count").toInt(), 2);
+        const auto tabCount = [window]() { return window->property("tabs").toList().size(); };
+        QCOMPARE(tabCount(), 1);
+
+        // The parent row opens the parent; it does not fold its children.
+        QMetaObject::invokeMethod(window, "activateTreeRow", Q_ARG(QVariant, 1));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Parent.md"));
+        QCOMPARE(tabCount(), 2);
+        QCOMPARE(list->property("count").toInt(), 2);
+
+        // The chevron is the fold control: it unfolds and folds without
+        // taking the row's note away. Delegate items are owned by the view,
+        // not the window, so they are found through the item tree.
+        const std::function<QQuickItem *(QQuickItem *, const QString &)> findItem =
+            [&](QQuickItem *parent, const QString &name) -> QQuickItem * {
+                for (QQuickItem *child : parent->childItems()) {
+                    if (child->objectName() == name)
+                        return child;
+                    if (QQuickItem *found = findItem(child, name))
+                        return found;
+                }
+                return nullptr;
+            };
+        QQuickItem *chevron = findItem(window->contentItem(), QStringLiteral("treeChevron1"));
+        QVERIFY(chevron);
+        const auto clickChevron = [window](QQuickItem *item) {
+            const QPointF scene =
+                item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+            QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, scene.toPoint());
+        };
+        clickChevron(chevron);
+        QTRY_COMPARE(list->property("count").toInt(), 3);
+        QCOMPARE(backend.fileName(), QStringLiteral("Parent.md"));
+        chevron = findItem(window->contentItem(), QStringLiteral("treeChevron1"));
+        QVERIFY(chevron);
+        clickChevron(chevron);
+        QTRY_COMPARE(list->property("count").toInt(), 2);
+
+        // Right and Left still fold and unfold from the keyboard, and Enter
+        // opens the row's note.
+        QMetaObject::invokeMethod(list, "forceActiveFocus");
+        list->setProperty("currentIndex", 1);
+        QTest::keyClick(window, Qt::Key_Right);
+        QTRY_COMPARE(list->property("count").toInt(), 3);
+        QTest::keyClick(window, Qt::Key_Left);
+        QTRY_COMPARE(list->property("count").toInt(), 2);
+    }
+
+    void openDialogStartsAtTheVaultAndOpensTabs() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("sub")));
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("sub/Current.md")));
+        QVERIFY(write(QStringLiteral("RootNote.md")));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("sub/Current.md"))));
+        backend.openDialog();
+
+        QObject *dialog = window->findChild<QObject *>(QStringLiteral("openFileDialog"));
+        QVERIFY(dialog);
+        QTRY_COMPARE(dialog->property("currentFolder").toUrl().toLocalFile(),
+                     root.absolutePath());
+
+        // A file picked here joins the tabs, like a tree or wiki-link open.
+        dialog->setProperty("selectedFile",
+                            QUrl::fromLocalFile(root.filePath(QStringLiteral("RootNote.md"))));
+        QVERIFY(QMetaObject::invokeMethod(dialog, "accepted"));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("RootNote.md"));
+        QCOMPARE(window->property("tabs").toList().size(), 2);
+    }
+
+    void treeRootAndCurrentPathNotifyLive() {
+        QTemporaryDir firstDirectory;
+        QTemporaryDir secondDirectory;
+        QVERIFY(firstDirectory.isValid());
+        QVERIFY(secondDirectory.isValid());
+        QDir first(firstDirectory.path());
+        QDir second(secondDirectory.path());
+        QVERIFY(first.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(second.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [](const QDir &root, const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(first, QStringLiteral("First.md")));
+        QVERIFY(write(first, QStringLiteral("Second.md")));
+        QVERIFY(write(second, QStringLiteral("Third.md")));
+
+        Backend backend;
+        QSignalSpy rootSpy(&backend, &Backend::fileTreeRootChanged);
+        QSignalSpy vaultSpy(&backend, &Backend::vaultRootChanged);
+        QSignalSpy pathSpy(&backend, &Backend::fileTreeCurrentPathChanged);
+
+        backend.open(QUrl::fromLocalFile(first.filePath(QStringLiteral("First.md"))));
+        QCOMPARE(backend.fileTreeRoot(), first.absolutePath());
+        QCOMPARE(backend.fileTreeCurrentPath(), QStringLiteral("First.md"));
+        QVERIFY(pathSpy.count() > 0);
+
+        // Another note in the same vault moves the highlight, not the root.
+        rootSpy.clear();
+        vaultSpy.clear();
+        pathSpy.clear();
+        backend.open(QUrl::fromLocalFile(first.filePath(QStringLiteral("Second.md"))));
+        QTRY_VERIFY(pathSpy.count() > 0);
+        QCOMPARE(rootSpy.count(), 0);
+        QCOMPARE(vaultSpy.count(), 0);
+        QCOMPARE(backend.fileTreeCurrentPath(), QStringLiteral("Second.md"));
+
+        // A note in another vault changes both, and the viewer header follows.
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QObject *header = window->findChild<QObject *>(QStringLiteral("fileViewerRoot"));
+        QVERIFY(header);
+        QTRY_COMPARE(header->property("text").toString(), first.dirName());
+
+        backend.open(QUrl::fromLocalFile(second.filePath(QStringLiteral("Third.md"))));
+        QTRY_VERIFY(rootSpy.count() > 0);
+        QVERIFY(vaultSpy.count() > 0);
+        QCOMPARE(backend.vaultRoot(), second.absolutePath());
+        QCOMPARE(backend.fileTreeRoot(), second.absolutePath());
+        QCOMPARE(backend.fileTreeCurrentPath(), QStringLiteral("Third.md"));
+        QTRY_COMPARE(header->property("text").toString(), second.dirName());
     }
 
     void opensLinkedNotesInTabsWithoutDuplicates() {

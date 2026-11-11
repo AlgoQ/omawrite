@@ -286,7 +286,7 @@ ApplicationWindow {
     }
 
     function highlightCurrentInTree() {
-        var current = backend.fileTreeCurrentPath();
+        var current = backend.fileTreeCurrentPath;
         for (var i = 0; i < treeRows.length; ++i) {
             if (!treeRows[i].isDir && treeRows[i].path === current) {
                 sidebarList.currentIndex = i;
@@ -298,7 +298,7 @@ ApplicationWindow {
     // Opens the way to the open note, so it can be seen in the tree: its
     // folders in folder mode, its ancestors in link mode.
     function revealCurrentInTree() {
-        var current = backend.fileTreeCurrentPath();
+        var current = backend.fileTreeCurrentPath;
         if (current === "")
             return;
         if (backend.treeMode === "folders") {
@@ -348,25 +348,37 @@ ApplicationWindow {
         }
     }
 
+    // A folder click folds in Folders mode, as it always has. A note row
+    // always opens its note; its children are folded from the chevron, so a
+    // parent can be both read and unfolded.
     function activateTreeRow(index) {
         if (index < 0 || index >= treeRows.length)
             return;
         var row = treeRows[index];
-        // A folder folds; a note with children folds in Links mode.
-        var foldable = backend.treeMode === "folders" ? row.isDir : row.hasChildren;
-        if (foldable) {
-            var expanded = backend.treeMode === "folders"
-                ? Object.assign({}, expandedFolders) : Object.assign({}, linksExpanded);
-            expanded[row.path] = !expanded[row.path];
-            if (backend.treeMode === "folders")
-                expandedFolders = expanded;
-            else
-                linksExpanded = expanded;
-            rebuildTree();
-            sidebarList.currentIndex = index;
-        } else {
-            openInTab(row.url);
+        if (backend.treeMode === "folders" && row.isDir) {
+            toggleTreeRow(index);
+            return;
         }
+        openInTab(row.url);
+    }
+
+    function toggleTreeRow(index) {
+        if (index < 0 || index >= treeRows.length)
+            return;
+        var row = treeRows[index];
+        var foldable = backend.treeMode === "folders" ? row.isDir : row.hasChildren;
+        if (!foldable)
+            return;
+
+        var expanded = backend.treeMode === "folders"
+            ? Object.assign({}, expandedFolders) : Object.assign({}, linksExpanded);
+        expanded[row.path] = !expanded[row.path];
+        if (backend.treeMode === "folders")
+            expandedFolders = expanded;
+        else
+            linksExpanded = expanded;
+        rebuildTree();
+        sidebarList.currentIndex = index;
     }
 
     function setTreeFolderOpen(index, open) {
@@ -376,7 +388,7 @@ ApplicationWindow {
         var foldable = backend.treeMode === "folders" ? row.isDir : row.hasChildren;
         if (!foldable || row.expanded === open)
             return;
-        activateTreeRow(index);
+        toggleTreeRow(index);
     }
 
     // Linked mentions: the notes that link to the open one, as a panel
@@ -1002,11 +1014,23 @@ ApplicationWindow {
             }
         }
 
+        // Notes moved or edited outside Omawrite settle here, after the
+        // index's watcher has marked its snapshot stale.
+        function onNoteIndexChanged() {
+            win.refreshBacklinks();
+            if (win.sidebarOpen) {
+                win.revealCurrentInTree();
+                win.rebuildTree();
+            }
+        }
+
         function onOpenDialogRequested() {
-            // Start where the document being written lives, not in whatever
-            // folder the dialog last remembered or the recent-files view.
-            if (backend.documentFolder.toString().length > 0)
-                openFileDialog.currentFolder = backend.documentFolder;
+            // Start at the vault root when the note belongs to one, so the
+            // picker reaches any note in the slipbox; otherwise stay beside
+            // the open note or in the last save folder.
+            var folder = backend.openDialogFolder();
+            if (folder.toString().length > 0)
+                openFileDialog.currentFolder = folder;
             openFileDialog.open();
         }
 
@@ -1045,10 +1069,13 @@ ApplicationWindow {
 
     Dialogs.FileDialog {
         id: openFileDialog
+        objectName: "openFileDialog"
         title: "Open File"
         fileMode: Dialogs.FileDialog.OpenFile
         nameFilters: ["Markdown files (*.md *.markdown)", "All files (*)"]
-        onAccepted: win.requestOpen(selectedFile)
+        // A picked file joins the tabs like one chosen from the tree, quick
+        // open, or a wiki link, rather than replacing the current note.
+        onAccepted: win.openInTab(selectedFile)
     }
 
     Dialogs.FileDialog {
@@ -2843,7 +2870,7 @@ ApplicationWindow {
                     objectName: "fileViewerRoot"
                     Layout.fillWidth: true
                     text: {
-                        var root = win.sidebarOpen ? backend.fileTreeRoot() : "";
+                        var root = win.sidebarOpen ? backend.fileTreeRoot : "";
                         return root.slice(root.lastIndexOf("/") + 1) || root;
                     }
                     color: win.textColor
@@ -2923,12 +2950,12 @@ ApplicationWindow {
                     required property var modelData
                     required property int index
                     readonly property bool current: !modelData.isDir
-                        && modelData.path === backend.fileTreeCurrentPath()
+                        && modelData.path === backend.fileTreeCurrentPath
                     width: ListView.view.width
                     height: win.scaledSize(30)
                     color: ListView.isCurrentItem && sidebarList.activeFocus
                         ? (win.darkMode ? "#44443b" : "#e2e0c4")
-                        : (current || treeMouse.containsMouse
+                        : (current || treeMouse.containsMouse || treeChevron.containsMouse
                            ? (win.darkMode ? "#35352f" : "#efeedc") : "transparent")
 
                     Row {
@@ -2976,6 +3003,24 @@ ApplicationWindow {
                         onClicked: {
                             sidebarList.currentIndex = treeRow.index;
                             win.activateTreeRow(treeRow.index);
+                        }
+                    }
+
+                    // The chevron is the fold control; the rest of the row
+                    // belongs to opening the note, children or not.
+                    MouseArea {
+                        id: treeChevron
+                        objectName: "treeChevron" + treeRow.index
+                        visible: treeRow.modelData.isDir || treeRow.modelData.hasChildren
+                        x: win.scaledSize(7) + treeRow.modelData.depth * win.scaledSize(16)
+                        y: 0
+                        width: win.scaledSize(22)
+                        height: parent.height
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            sidebarList.currentIndex = treeRow.index;
+                            win.toggleTreeRow(treeRow.index);
                         }
                     }
                 }
