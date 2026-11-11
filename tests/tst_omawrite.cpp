@@ -543,6 +543,58 @@ private slots:
         QCOMPARE(window->property("activeTab").toInt(), 1);
     }
 
+    void goesBackAndForwardThroughOpenedFiles() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("First.md")));
+        QVERIFY(write(QStringLiteral("Second.md")));
+        const auto url = [&root](const QString &name) {
+            return QUrl::fromLocalFile(root.filePath(name));
+        };
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(url(QStringLiteral("First.md")));
+        QTRY_COMPARE(backend.fileUrl(), url(QStringLiteral("First.md")));
+        backend.open(url(QStringLiteral("Second.md")));
+        QTRY_COMPARE(backend.fileUrl(), url(QStringLiteral("Second.md")));
+
+        // Two files were visited, so a step back is available and lights the
+        // footer arrow.
+        QObject *backButton = window->findChild<QObject *>(QStringLiteral("historyBackButton"));
+        QObject *forwardButton = window->findChild<QObject *>(QStringLiteral("historyForwardButton"));
+        QVERIFY(backButton);
+        QVERIFY(forwardButton);
+        QTRY_VERIFY(backButton->property("opacity").toReal() > 0.9);
+
+        QTest::keyClick(window, Qt::Key_Left, Qt::AltModifier);
+        QTRY_COMPARE(backend.fileUrl(), url(QStringLiteral("First.md")));
+        QTRY_VERIFY(forwardButton->property("opacity").toReal() > 0.9);
+
+        QTest::keyClick(window, Qt::Key_Right, Qt::AltModifier);
+        QTRY_COMPARE(backend.fileUrl(), url(QStringLiteral("Second.md")));
+        QTRY_VERIFY(forwardButton->property("opacity").toReal() < 0.9);
+    }
+
     void showsAFileViewerOfTheSlipbox() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());

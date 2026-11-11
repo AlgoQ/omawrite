@@ -40,6 +40,9 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
   `Ctrl+1` to `Ctrl+8` go to that tab, `Ctrl+9` to the last, `Ctrl+Tab` and
   `Ctrl+Shift+Tab` step through them, and `Ctrl+W` closes the current one.
   Switching reopens the tab's file, so undo history does not carry across tabs.
+- `Alt+Left` and `Alt+Right` go back and forward through the files opened in
+  the window, tab switches included. The arrows at the left of the footer do
+  the same and dim when there is nowhere to go.
 - `Ctrl+P` opens the system print dialog.
 - `Ctrl+N` opens a new Omawrite window.
 - `Ctrl+Z`, `Ctrl+Shift+Z`, and `Ctrl+Y` handle undo and redo.

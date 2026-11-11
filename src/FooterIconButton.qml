@@ -64,6 +64,21 @@ Item {
                 context.arc(7, 6.5, 3.5, 0, Math.PI * 2);
                 context.moveTo(9.5, 9);
                 context.lineTo(13, 12.5);
+            } else if (control.iconName === "back") {
+                // An arrow pointing left: shaft and two head strokes.
+                context.moveTo(13.5, 8);
+                context.lineTo(2.5, 8);
+                context.moveTo(2.5, 8);
+                context.lineTo(6.5, 4);
+                context.moveTo(2.5, 8);
+                context.lineTo(6.5, 12);
+            } else if (control.iconName === "forward") {
+                context.moveTo(2.5, 8);
+                context.lineTo(13.5, 8);
+                context.moveTo(13.5, 8);
+                context.lineTo(9.5, 4);
+                context.moveTo(13.5, 8);
+                context.lineTo(9.5, 12);
             } else if (control.iconName === "settings") {
                 // A gear: outer ring, eight spokes, and a hub.
                 context.arc(8, 8, 3.2, 0, Math.PI * 2);

@@ -416,6 +416,57 @@ ApplicationWindow {
     // A tab to drop once the file next to it has actually opened.
     property string closingTabUrl: ""
 
+    // Visited files, oldest first, and the one on screen. Opening a file
+    // appends to the list; going back or forward moves through it instead.
+    // The window keeps this rather than the backend because a tab switch and
+    // a link click are the same thing to a writer: another file on screen.
+    property var fileHistory: []
+    property int historyIndex: -1
+    // The entry a back or forward step is waiting to land on. It stays set
+    // until that file opens, so a cancelled unsaved prompt changes nothing.
+    property int historyPending: -1
+    readonly property bool canGoBack: historyIndex > 0
+    readonly property bool canGoForward:
+        historyIndex >= 0 && historyIndex < fileHistory.length - 1
+
+    function recordHistory(url) {
+        var wanted = url.toString();
+        if (historyIndex >= 0 && fileHistory[historyIndex] === wanted)
+            return;
+        var list = fileHistory.slice(0, historyIndex + 1);
+        list.push(wanted);
+        // A long session should not grow an unbounded list; a hundred notes
+        // reaches back far past what anyone steps through by hand.
+        if (list.length > 100)
+            list.shift();
+        fileHistory = list;
+        historyIndex = list.length - 1;
+    }
+
+    // Called when a file really opened: either a new visit to record, or the
+    // end of a back/forward step that is now on screen.
+    function noteFileShown(url) {
+        var current = url.toString();
+        if (historyPending >= 0) {
+            if (historyPending < fileHistory.length
+                    && fileHistory[historyPending] === current) {
+                historyIndex = historyPending;
+                historyPending = -1;
+                return;
+            }
+            historyPending = -1;
+        }
+        recordHistory(current);
+    }
+
+    function stepHistory(direction) {
+        var target = historyIndex + direction;
+        if (target < 0 || target >= fileHistory.length)
+            return;
+        historyPending = target;
+        requestOpen(fileHistory[target]);
+    }
+
     function tabIndexOf(url) {
         for (var i = 0; i < tabs.length; ++i) {
             if (tabs[i].url === url)
@@ -472,6 +523,10 @@ ApplicationWindow {
         var current = backend.fileUrl.toString();
         if (current === "")
             return;
+
+        // Every file that reaches the window joins the back/forward list;
+        // a step that is still in flight settles its index here instead.
+        noteFileShown(current);
 
         var list = tabs.slice();
         // The signal fires before the new text loads, so the caret is still
@@ -775,6 +830,18 @@ ApplicationWindow {
     }
 
     Shortcut {
+        sequences: win.seqs("back")
+        context: Qt.WindowShortcut
+        onActivated: win.stepHistory(-1)
+    }
+
+    Shortcut {
+        sequences: win.seqs("forward")
+        context: Qt.WindowShortcut
+        onActivated: win.stepHistory(1)
+    }
+
+    Shortcut {
         sequence: win.seq("backlinks")
         context: Qt.WindowShortcut
         onActivated: win.toggleBacklinks()
@@ -935,6 +1002,7 @@ ApplicationWindow {
         onRejected: {
             win.awaitingPendingSave = false;
             win.pendingAction = "";
+            win.historyPending = -1;
         }
     }
 
@@ -964,7 +1032,10 @@ ApplicationWindow {
             win.awaitingPendingSave = true;
             backend.save();
         }
-        onCancelRequested: win.pendingAction = ""
+        onCancelRequested: {
+            win.pendingAction = "";
+            win.historyPending = -1;
+        }
     }
 
     ExternalChangeDialog {
@@ -2531,6 +2602,24 @@ ApplicationWindow {
             anchors.bottomMargin: 10
             spacing: 12
             opacity: 0.55
+
+            FooterIconButton {
+                objectName: "historyBackButton"
+                iconName: "back"
+                iconColor: win.mutedColor
+                tooltip: "Back to previous file (Alt+Left)"
+                opacity: win.canGoBack ? 1.0 : 0.35
+                onClicked: win.stepHistory(-1)
+            }
+
+            FooterIconButton {
+                objectName: "historyForwardButton"
+                iconName: "forward"
+                iconColor: win.mutedColor
+                tooltip: "Forward to next file (Alt+Right)"
+                opacity: win.canGoForward ? 1.0 : 0.35
+                onClicked: win.stepHistory(1)
+            }
 
             FooterIconButton {
                 objectName: "saveButton"

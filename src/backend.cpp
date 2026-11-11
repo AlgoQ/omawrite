@@ -156,6 +156,8 @@ static const QList<ShortcutDef> shortcutDefs = {
     {"next-tab", "Next Tab", {"Ctrl+Tab"}},
     {"prev-tab", "Previous Tab", {"Ctrl+Shift+Tab"}},
     {"close-tab", "Close Tab", {"Ctrl+W"}},
+    {"back", "Back to Previous File", {"Alt+Left", "Alt+["}},
+    {"forward", "Forward to Next File", {"Alt+Right", "Alt+]"}},
     {"backlinks", "Linked Mentions (Backlinks)", {"Ctrl+Shift+B"}},
     {"new-window", "New Window", {"Ctrl+N"}},
     {"print", "Print", {"Ctrl+P"}},
