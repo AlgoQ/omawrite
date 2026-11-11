@@ -145,7 +145,7 @@ Dialog {
                     Label {
                         Layout.fillWidth: true
                         Layout.minimumWidth: 0
-                        text: modelData.description
+                        text: modelData.label
                         color: modelData.isDefault ? root.textColor : root.strongTextColor
                         font.family: "IBM Plex Mono"
                         font.pixelSize: Math.round(12 * root.textScale)

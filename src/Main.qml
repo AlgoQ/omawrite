@@ -574,23 +574,65 @@ ApplicationWindow {
         }
     }
 
-    function openQuickOpen() {
-        backend.refreshNoteIndex();
-        quickOpen.open();
-    }
-
-    function updateQuickOpen() {
-        quickOpenList.model = backend.noteSuggestions(quickOpenField.text);
-        quickOpenList.currentIndex = quickOpenList.count > 0 ? 0 : -1;
-    }
-
-    function openQuickOpenSelection() {
-        if (quickOpenList.currentIndex < 0
-                || quickOpenList.currentIndex >= quickOpenList.model.length)
+    // The command palette lists the backend's actions and the slipbox's notes
+    // in one list. Ctrl+P opens it, and Ctrl+Shift+O opens the same palette in
+    // file-only mode, the old quick-open key.
+    function openCommandPalette(fileOnly) {
+        if (commandPalette.visible && commandPalette.fileMode === Boolean(fileOnly)) {
+            commandPalette.close();
             return;
-        var note = quickOpenList.model[quickOpenList.currentIndex];
-        quickOpen.close();
-        openInTab(note.url);
+        }
+        backend.refreshNoteIndex();
+        commandPalette.open(Boolean(fileOnly));
+    }
+
+    // Every action, whether it comes from a Shortcut or the palette, lands
+    // here. The ids are the backend registry's, so the two paths cannot drift.
+    function runAction(id) {
+        switch (id) {
+        case "save": backend.save(); break;
+        case "save-as": backend.saveAsDialog(); break;
+        case "open-file": backend.openDialog(); break;
+        case "command-palette": openCommandPalette(false); break;
+        case "toggle-sidebar": toggleSidebar(); break;
+        case "quick-open": openCommandPalette(true); break;
+        case "tab-1": switchTab(0); break;
+        case "tab-2": switchTab(1); break;
+        case "tab-3": switchTab(2); break;
+        case "tab-4": switchTab(3); break;
+        case "tab-5": switchTab(4); break;
+        case "tab-6": switchTab(5); break;
+        case "tab-7": switchTab(6); break;
+        case "tab-8": switchTab(7); break;
+        case "tab-9": switchTab(tabs.length - 1); break;
+        case "next-tab": stepTab(1); break;
+        case "prev-tab": stepTab(-1); break;
+        case "close-tab": closeTab(activeTab); break;
+        case "back": stepHistory(-1); break;
+        case "forward": stepHistory(1); break;
+        case "backlinks": toggleBacklinks(); break;
+        case "new-window": backend.newWindow(); break;
+        case "print": backend.printDocument(); break;
+        case "copy-html": backend.copyAsHtml(); break;
+        case "fullscreen": toggleFullScreen(); break;
+        case "undo": editor.undo(); break;
+        case "redo": editor.redo(); break;
+        case "find": openSearch(false); break;
+        case "find-replace": openSearch(true); break;
+        case "find-next": if (searchOpen) moveSearch(1); break;
+        case "bold": editor.wrapSelection("**"); break;
+        case "italic": editor.wrapSelection("*"); break;
+        case "strikethrough": editor.wrapSelection("~~"); break;
+        case "insert-link": editor.insertLink(); break;
+        case "follow-link": followLinkAt(editor.cursorPosition); break;
+        case "toggle-task": editor.toggleTaskAtCursor(); break;
+        case "zoom-in": backend.increaseTextSize(); break;
+        case "zoom-out": backend.decreaseTextSize(); break;
+        case "zoom-reset": backend.resetTextSize(); break;
+        case "shortcuts-dialog": shortcutsDialog.open(); break;
+        case "settings": settingsDialog.open(); break;
+        case "font": fontPicker.opened ? fontPicker.close() : fontPicker.open(); break;
+        }
     }
 
     FontMetrics {
@@ -711,222 +753,238 @@ ApplicationWindow {
         onTriggered: win.updateSearch(true)
     }
 
+    // Every keyboard action goes through runAction, so a palette command and
+    // the key beside it are the same piece of code. The ids and their live
+    // keys come from the backend's action registry.
     Shortcut {
         sequence: win.seq("save")
-        onActivated: backend.save()
+        onActivated: win.runAction("save")
+    }
+
+    Shortcut {
+        objectName: "openFileShortcut"
+        sequence: win.seq("open-file")
+        onActivated: win.runAction("open-file")
+    }
+
+    Shortcut {
+        objectName: "commandPaletteShortcut"
+        sequence: win.seq("command-palette")
+        onActivated: win.runAction("command-palette")
     }
 
     Shortcut {
         sequence: win.seq("find-replace")
-        onActivated: win.openSearch(true)
+        onActivated: win.runAction("find-replace")
     }
 
     Shortcut {
         sequence: win.seq("bold")
         context: Qt.WindowShortcut
-        onActivated: editor.wrapSelection("**")
+        onActivated: win.runAction("bold")
     }
 
     Shortcut {
         sequence: win.seq("italic")
         context: Qt.WindowShortcut
-        onActivated: editor.wrapSelection("*")
+        onActivated: win.runAction("italic")
     }
 
     Shortcut {
         sequence: win.seq("strikethrough")
         context: Qt.WindowShortcut
-        onActivated: editor.wrapSelection("~~")
+        onActivated: win.runAction("strikethrough")
     }
 
     Shortcut {
         sequence: win.seq("insert-link")
         context: Qt.WindowShortcut
-        onActivated: editor.insertLink()
+        onActivated: win.runAction("insert-link")
     }
 
     Shortcut {
         sequences: win.seqs("follow-link")
         context: Qt.WindowShortcut
-        onActivated: win.followLinkAt(editor.cursorPosition)
+        onActivated: win.runAction("follow-link")
     }
 
     Shortcut {
         sequences: win.seqs("toggle-task")
         context: Qt.WindowShortcut
-        onActivated: editor.toggleTaskAtCursor()
+        onActivated: win.runAction("toggle-task")
     }
 
     Shortcut {
         sequence: win.seq("tab-1")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(0)
+        onActivated: win.runAction("tab-1")
     }
 
     Shortcut {
         sequence: win.seq("tab-2")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(1)
+        onActivated: win.runAction("tab-2")
     }
 
     Shortcut {
         sequence: win.seq("tab-3")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(2)
+        onActivated: win.runAction("tab-3")
     }
 
     Shortcut {
         sequence: win.seq("tab-4")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(3)
+        onActivated: win.runAction("tab-4")
     }
 
     Shortcut {
         sequence: win.seq("tab-5")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(4)
+        onActivated: win.runAction("tab-5")
     }
 
     Shortcut {
         sequence: win.seq("tab-6")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(5)
+        onActivated: win.runAction("tab-6")
     }
 
     Shortcut {
         sequence: win.seq("tab-7")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(6)
+        onActivated: win.runAction("tab-7")
     }
 
     Shortcut {
         sequence: win.seq("tab-8")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(7)
+        onActivated: win.runAction("tab-8")
     }
 
     Shortcut {
         sequence: win.seq("tab-9")
         context: Qt.WindowShortcut
-        onActivated: win.switchTab(win.tabs.length - 1)
+        onActivated: win.runAction("tab-9")
     }
 
     Shortcut {
         sequence: win.seq("next-tab")
         context: Qt.WindowShortcut
-        onActivated: win.stepTab(1)
+        onActivated: win.runAction("next-tab")
     }
 
     Shortcut {
         sequence: win.seq("prev-tab")
         context: Qt.WindowShortcut
-        onActivated: win.stepTab(-1)
+        onActivated: win.runAction("prev-tab")
     }
 
     Shortcut {
         sequence: win.seq("close-tab")
         context: Qt.WindowShortcut
-        onActivated: win.closeTab(win.activeTab)
+        onActivated: win.runAction("close-tab")
     }
 
     Shortcut {
         sequences: win.seqs("back")
         context: Qt.WindowShortcut
-        onActivated: win.stepHistory(-1)
+        onActivated: win.runAction("back")
     }
 
     Shortcut {
         sequences: win.seqs("forward")
         context: Qt.WindowShortcut
-        onActivated: win.stepHistory(1)
+        onActivated: win.runAction("forward")
     }
 
     Shortcut {
         sequence: win.seq("backlinks")
         context: Qt.WindowShortcut
-        onActivated: win.toggleBacklinks()
+        onActivated: win.runAction("backlinks")
     }
 
     Shortcut {
         sequence: win.seq("quick-open")
         context: Qt.WindowShortcut
-        onActivated: win.openQuickOpen()
+        onActivated: win.runAction("quick-open")
     }
 
     Shortcut {
         sequences: win.seqs("shortcuts-dialog")
-        onActivated: shortcutsDialog.open()
+        onActivated: win.runAction("shortcuts-dialog")
     }
 
     Shortcut {
         // Ctrl++ is a different shortcut to Qt, not a shifted Ctrl+=, and it is
         // the only one a layout that puts + on its own key can reach.
         sequences: win.seqs("zoom-in")
-        onActivated: backend.increaseTextSize()
+        onActivated: win.runAction("zoom-in")
     }
 
     Shortcut {
         sequence: win.seq("zoom-out")
-        onActivated: backend.decreaseTextSize()
+        onActivated: win.runAction("zoom-out")
     }
 
     Shortcut {
         sequence: win.seq("zoom-reset")
-        onActivated: backend.resetTextSize()
+        onActivated: win.runAction("zoom-reset")
     }
 
     Shortcut {
         objectName: "toggleSidebarShortcut"
         sequence: win.seq("toggle-sidebar")
-        onActivated: win.toggleSidebar()
+        onActivated: win.runAction("toggle-sidebar")
     }
 
     Shortcut {
         sequence: win.seq("new-window")
-        onActivated: backend.newWindow()
+        onActivated: win.runAction("new-window")
     }
 
     Shortcut {
         sequence: win.seq("save-as")
-        onActivated: backend.saveAsDialog()
+        onActivated: win.runAction("save-as")
     }
 
     Shortcut {
+        objectName: "printShortcut"
         sequence: win.seq("print")
-        onActivated: backend.printDocument()
+        onActivated: win.runAction("print")
     }
 
     Shortcut {
         sequence: win.seq("copy-html")
-        onActivated: backend.copyAsHtml()
+        onActivated: win.runAction("copy-html")
     }
 
     Shortcut {
         sequences: win.seqs("fullscreen")
-        onActivated: toggleFullScreen()
+        onActivated: win.runAction("fullscreen")
     }
 
     Shortcut {
         sequence: win.seq("undo")
         context: Qt.WindowShortcut
-        onActivated: editor.undo()
+        onActivated: win.runAction("undo")
     }
 
     Shortcut {
         sequences: win.seqs("redo")
         context: Qt.WindowShortcut
-        onActivated: editor.redo()
+        onActivated: win.runAction("redo")
     }
 
     Shortcut {
         sequence: win.seq("find")
-        onActivated: win.openSearch(false)
+        onActivated: win.runAction("find")
     }
 
     Shortcut {
         sequence: win.seq("find-next")
         enabled: win.searchOpen
-        onActivated: win.moveSearch(1)
+        onActivated: win.runAction("find-next")
     }
 
     Connections {
@@ -1072,158 +1130,22 @@ ApplicationWindow {
         containerHeight: win.height
     }
 
-    // Ctrl+Shift+O: search every note in the slipbox by name, without leaving
-    // the document. The ordinary Open dialog is for reaching files outside it.
-    // A plain overlay rather than a Popup, so the text field owns the keyboard
-    // from the first keypress.
-    Item {
-        id: quickOpen
-        objectName: "quickOpen"
+    // Ctrl+P: one list over the action registry and the slipbox's notes.
+    // Ctrl+Shift+O opens the same palette with files only.
+    CommandPalette {
+        id: commandPalette
         anchors.fill: parent
-        visible: false
-        z: 100
+        darkMode: win.darkMode
+        textColor: win.textColor
+        mutedColor: win.mutedColor
+        selectionFill: win.selectionFill
+        selectionTextColor: win.selectionTextColor
+        textScale: win.textScale
+        fontFamily: backend.editorFont
 
-        function open() {
-            visible = true;
-            quickOpenField.text = "";
-            win.updateQuickOpen();
-            Qt.callLater(function() {
-                quickOpenField.forceActiveFocus();
-                quickOpenField.cursorPosition = quickOpenField.text.length;
-            });
-        }
-
-        function close() {
-            if (!visible)
-                return;
-            visible = false;
-            editor.forceActiveFocus();
-        }
-
-        Rectangle {
-            anchors.fill: parent
-            color: Qt.rgba(0, 0, 0, 0.5)
-
-            MouseArea {
-                anchors.fill: parent
-                onClicked: quickOpen.close()
-            }
-        }
-
-        Rectangle {
-            id: quickOpenPanel
-            x: Math.round((win.width - width) / 2)
-            y: Math.round(win.height * 0.12)
-            width: Math.min(win.scaledSize(620), win.width - 48)
-            height: Math.min(win.scaledSize(420), win.height - 160)
-            color: win.darkMode ? "#22221f" : "#fffef2"
-            border.color: win.darkMode ? "#4f525a" : "#d9d8c8"
-            border.width: 1
-            radius: 9
-
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: 0
-
-                TextField {
-                    id: quickOpenField
-                    objectName: "quickOpenField"
-                    Layout.fillWidth: true
-                    placeholderText: text.length === 0 ? "Open other file…" : ""
-                    placeholderTextColor: win.mutedColor
-                    color: win.textColor
-                    selectionColor: win.selectionFill
-                    selectedTextColor: win.selectionTextColor
-                    font.family: backend.editorFont
-                    font.pixelSize: win.scaledSize(17)
-                    leftPadding: win.scaledSize(16)
-                    rightPadding: win.scaledSize(16)
-                    topPadding: win.scaledSize(14)
-                    bottomPadding: win.scaledSize(14)
-                    background: Rectangle {
-                        color: win.darkMode ? "#22221f" : "#fffef2"
-                    }
-                    onTextChanged: win.updateQuickOpen()
-                    Keys.onDownPressed: quickOpenList.incrementCurrentIndex()
-                    Keys.onUpPressed: quickOpenList.decrementCurrentIndex()
-                    Keys.onReturnPressed: win.openQuickOpenSelection()
-                    Keys.onEscapePressed: quickOpen.close()
-                }
-
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.leftMargin: 12
-                    Layout.rightMargin: 12
-                    height: 1
-                    color: win.darkMode ? "#3a3a33" : "#e3e2d2"
-                }
-
-                ListView {
-                    id: quickOpenList
-                    objectName: "quickOpenList"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    Layout.topMargin: 4
-                    Layout.bottomMargin: 4
-                    clip: true
-                    boundsBehavior: Flickable.StopAtBounds
-                    highlightFollowsCurrentItem: true
-
-                    delegate: Rectangle {
-                        id: quickRow
-                        required property var modelData
-                        required property int index
-                        width: ListView.view.width
-                        height: win.scaledSize(40)
-                        radius: 6
-                        color: index === quickOpenList.currentIndex
-                            ? (win.darkMode ? "#35352f" : "#efeedc")
-                            : "transparent"
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 16
-                            anchors.rightMargin: 16
-                            spacing: 12
-
-                            Text {
-                                Layout.fillWidth: true
-                                text: quickRow.modelData.name
-                                color: win.textColor
-                                font.family: backend.editorFont
-                                font.pixelSize: win.scaledSize(15)
-                                elide: Text.ElideRight
-                            }
-
-                            Text {
-                                readonly property string folder: {
-                                    var path = quickRow.modelData.path;
-                                    var slash = path.lastIndexOf("/");
-                                    return slash >= 0 ? path.slice(0, slash) : "";
-                                }
-                                visible: folder !== ""
-                                text: folder
-                                color: win.mutedColor
-                                font.family: backend.editorFont
-                                font.pixelSize: win.scaledSize(12)
-                                elide: Text.ElideRight
-                                Layout.maximumWidth: quickOpenPanel.width * 0.4
-                            }
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            onEntered: quickOpenList.currentIndex = quickRow.index
-                            onClicked: {
-                                quickOpenList.currentIndex = quickRow.index;
-                                win.openQuickOpenSelection();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        onCommandChosen: function(id) { win.runAction(id) }
+        onFileChosen: function(url) { win.openInTab(url) }
+        onClosed: editor.forceActiveFocus()
     }
 
     Item {
@@ -2607,7 +2529,7 @@ ApplicationWindow {
                 objectName: "historyBackButton"
                 iconName: "back"
                 iconColor: win.mutedColor
-                tooltip: "Back to previous file (Alt+Left)"
+                tooltip: "Back to previous file (" + win.seq("back") + ")"
                 opacity: win.canGoBack ? 1.0 : 0.35
                 onClicked: win.stepHistory(-1)
             }
@@ -2616,7 +2538,7 @@ ApplicationWindow {
                 objectName: "historyForwardButton"
                 iconName: "forward"
                 iconColor: win.mutedColor
-                tooltip: "Forward to next file (Alt+Right)"
+                tooltip: "Forward to next file (" + win.seq("forward") + ")"
                 opacity: win.canGoForward ? 1.0 : 0.35
                 onClicked: win.stepHistory(1)
             }
@@ -2625,24 +2547,24 @@ ApplicationWindow {
                 objectName: "saveButton"
                 iconName: "save"
                 iconColor: win.mutedColor
-                tooltip: "Save"
-                onClicked: backend.save()
+                tooltip: "Save (" + win.seq("save") + ")"
+                onClicked: win.runAction("save")
             }
 
             FooterIconButton {
                 objectName: "openButton"
                 iconName: "open"
                 iconColor: win.mutedColor
-                tooltip: "Open"
-                onClicked: backend.openDialog()
+                tooltip: "Open file (" + win.seq("open-file") + ")"
+                onClicked: win.runAction("open-file")
             }
 
             FooterIconButton {
                 objectName: "quickOpenButton"
                 iconName: "search"
                 iconColor: win.mutedColor
-                tooltip: "Open other file (Ctrl+Shift+O)"
-                onClicked: win.openQuickOpen()
+                tooltip: "Open other file (" + win.seq("quick-open") + ")"
+                onClicked: win.runAction("quick-open")
             }
 
             FooterIconButton {
@@ -2651,7 +2573,7 @@ ApplicationWindow {
                 iconName: "font"
                 iconColor: win.mutedColor
                 tooltip: "Font"
-                onClicked: fontPicker.opened ? fontPicker.close() : fontPicker.open()
+                onClicked: win.runAction("font")
             }
 
             FooterIconButton {
@@ -2659,7 +2581,7 @@ ApplicationWindow {
                 iconName: "settings"
                 iconColor: win.mutedColor
                 tooltip: "Settings"
-                onClicked: settingsDialog.open()
+                onClicked: win.runAction("settings")
             }
 
             Label {

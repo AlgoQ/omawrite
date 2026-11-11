@@ -646,10 +646,10 @@ private slots:
         QObject *list = window->findChild<QObject *>(QStringLiteral("fileViewerList"));
         QVERIFY(viewer);
         QVERIFY(list);
-        // Opened with a file, so the viewer waits for Ctrl+O, which also
+        // Opened with a file, so the viewer waits for Ctrl+B, which also
         // unfolds the way to the open note.
         QVERIFY(!viewer->property("visible").toBool());
-        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier);
         QTRY_VERIFY(viewer->property("visible").toBool());
         // Links mode is the default: every note is a root here, sorted by
         // name, so Deeper, Nested, Top, zeta.
@@ -680,9 +680,9 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(collapseButton, "clicked"));
         QTRY_VERIFY(!viewer->property("visible").toBool());
 
-        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier);
         QTRY_VERIFY(viewer->property("visible").toBool());
-        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier);
         QTRY_VERIFY(!viewer->property("visible").toBool());
     }
 
@@ -731,7 +731,7 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(speedField, "editingFinished"));
         QTRY_COMPARE(backend.scrollSpeed(), 1.5);
 
-        // Key edits apply live through the bindings: Ctrl+O stops toggling
+        // Key edits apply live through the bindings: Ctrl+B stops toggling
         // the viewer until the key is reset. The blank window opens the
         // viewer by itself, so close it and the modal dialog first.
         QVERIFY(QMetaObject::invokeMethod(dialog, "close"));
@@ -744,18 +744,18 @@ private slots:
         QObject *sidebarShortcut =
             window->findChild<QObject *>(QStringLiteral("toggleSidebarShortcut"));
         QVERIFY(sidebarShortcut);
-        QCOMPARE(sidebarShortcut->property("sequence").toString(), QStringLiteral("Ctrl+O"));
+        QCOMPARE(sidebarShortcut->property("sequence").toString(), QStringLiteral("Ctrl+B"));
         QVERIFY(backend.setShortcut(QStringLiteral("toggle-sidebar"),
                                     QStringLiteral("Ctrl+E")));
         QTRY_COMPARE(sidebarShortcut->property("sequence").toString(),
                      QStringLiteral("Ctrl+E"));
         backend.resetShortcut(QStringLiteral("toggle-sidebar"));
         QTRY_COMPARE(sidebarShortcut->property("sequence").toString(),
-                     QStringLiteral("Ctrl+O"));
+                     QStringLiteral("Ctrl+B"));
         backend.setScrollSpeed(2.0);
     }
 
-    void searchesOtherNotesFromQuickOpen() {
+    void commandPaletteSearchesCommandsAndFiles() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         QDir root(dir.path());
@@ -784,30 +784,77 @@ private slots:
         window->show();
         QVERIFY(QTest::qWaitForWindowExposed(window));
 
-        QObject *quickOpen = window->findChild<QObject *>(QStringLiteral("quickOpen"));
-        QObject *field = window->findChild<QObject *>(QStringLiteral("quickOpenField"));
-        QObject *list = window->findChild<QObject *>(QStringLiteral("quickOpenList"));
-        QVERIFY(quickOpen);
+        QObject *palette = window->findChild<QObject *>(QStringLiteral("commandPalette"));
+        QObject *field = window->findChild<QObject *>(QStringLiteral("commandPaletteField"));
+        QObject *list = window->findChild<QObject *>(QStringLiteral("commandPaletteList"));
+        QVERIFY(palette);
         QVERIFY(field);
         QVERIFY(list);
+        const auto rows = [palette] { return palette->property("rows").toList(); };
+        const auto type = [window](const QString &text) {
+            for (const QChar character : text)
+                QTest::keyClick(window, character.toLatin1());
+        };
 
         backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("current.md"))));
-        QMetaObject::invokeMethod(window, "openQuickOpen");
-        QTRY_VERIFY(quickOpen->property("visible").toBool());
+
+        // Ctrl+P opens on the command list, plus every note in the slipbox.
+        QTest::keyClick(window, Qt::Key_P, Qt::ControlModifier);
+        QTRY_VERIFY(palette->property("visible").toBool());
         QTRY_VERIFY(field->property("activeFocus").toBool());
         QCOMPARE(field->property("placeholderText").toString(),
-                 QStringLiteral("Open other file…"));
-
-        for (const QChar character : QStringLiteral("brand"))
-            QTest::keyClick(window, character.toLatin1());
-        QCOMPARE(field->property("text").toString(), QStringLiteral("brand"));
-        QCOMPARE(field->property("placeholderText").toString(), QString());
-        QTRY_COMPARE(list->property("count").toInt(), 1);
+                 QStringLiteral("Search commands and files…"));
+        QTRY_VERIFY(rows().size() > 4);
         QCOMPARE(list->property("currentIndex").toInt(), 0);
+        QCOMPARE(rows().constFirst().toMap().value(QStringLiteral("kind")).toString(),
+                 QStringLiteral("command"));
 
-        QMetaObject::invokeMethod(window, "openQuickOpenSelection");
+        // The arrow keys move the selection and Page Down jumps by a screen.
+        QTest::keyClick(window, Qt::Key_Down);
+        QCOMPARE(list->property("currentIndex").toInt(), 1);
+        QTest::keyClick(window, Qt::Key_PageDown);
+        QVERIFY(list->property("currentIndex").toInt() > 1);
+        QTest::keyClick(window, Qt::Key_PageUp);
+        QVERIFY(list->property("currentIndex").toInt() >= 0);
+
+        // A query narrows files through the backend and marks the row as one.
+        type(QStringLiteral("brand"));
+        QCOMPARE(field->property("text").toString(), QStringLiteral("brand"));
+        QTRY_COMPARE(rows().size(), 1);
+        const QVariantMap file = rows().constFirst().toMap();
+        QCOMPARE(file.value(QStringLiteral("kind")).toString(), QStringLiteral("file"));
+        QCOMPARE(file.value(QStringLiteral("label")).toString(), QStringLiteral("Branding"));
+        QCOMPARE(list->property("currentIndex").toInt(), 0);
+        QTest::keyClick(window, Qt::Key_Return);
         QTRY_COMPARE(backend.fileName(), QStringLiteral("Branding.md"));
-        QVERIFY(!quickOpen->property("visible").toBool());
+        QVERIFY(!palette->property("visible").toBool());
+
+        // Commands run through the same runAction the keyboard uses.
+        const qreal scale = backend.textScale();
+        QTest::keyClick(window, Qt::Key_P, Qt::ControlModifier);
+        QTRY_VERIFY(palette->property("visible").toBool());
+        type(QStringLiteral("increase text"));
+        QTRY_COMPARE(rows().size(), 1);
+        const QVariantMap command = rows().constFirst().toMap();
+        QCOMPARE(command.value(QStringLiteral("kind")).toString(), QStringLiteral("command"));
+        QCOMPARE(command.value(QStringLiteral("id")).toString(), QStringLiteral("zoom-in"));
+        QTest::keyClick(window, Qt::Key_Return);
+        QTRY_VERIFY(backend.textScale() > scale);
+        QVERIFY(!palette->property("visible").toBool());
+        backend.resetTextSize();
+
+        // Ctrl+Shift+O is the same palette restricted to files.
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_VERIFY(palette->property("visible").toBool());
+        QVERIFY(palette->property("fileMode").toBool());
+        QCOMPARE(field->property("placeholderText").toString(),
+                 QStringLiteral("Open other file…"));
+        QTRY_COMPARE(rows().size(), 3);
+        for (const QVariant &row : rows())
+            QCOMPARE(row.toMap().value(QStringLiteral("kind")).toString(),
+                     QStringLiteral("file"));
+        QTest::keyClick(window, Qt::Key_Escape);
+        QTRY_VERIFY(!palette->property("visible").toBool());
     }
 
     void alignsWrappedListLinesWithTheirText() {
@@ -1739,7 +1786,9 @@ private slots:
             for (const QChar key : keys)
                 QTest::keyClick(window, key.toLatin1());
         };
-        const auto bold = [window] { QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier); };
+        const auto bold = [window] {
+            QTest::keyClick(window, Qt::Key_B, Qt::ControlModifier | Qt::AltModifier);
+        };
         const auto text = [editor] { return editor->property("text").toString(); };
 
         // Ctrl+B, type, Ctrl+B ends the bold instead of stacking markers.
@@ -4893,7 +4942,7 @@ private slots:
     void shortcutDefaultsCanBeOverriddenAndReset() {
         Backend backend;
         QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
-                 (QStringList{QStringLiteral("Ctrl+O")}));
+                 (QStringList{QStringLiteral("Ctrl+B")}));
         QVERIFY(!backend.shortcutIds().isEmpty());
         QVERIFY(!backend.shortcutDescription(QStringLiteral("toggle-sidebar")).isEmpty());
 
@@ -4912,7 +4961,175 @@ private slots:
 
         backend.resetShortcut(QStringLiteral("toggle-sidebar"));
         QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+B")}));
+    }
+
+    void actionRegistryCarriesLabelsAndKeys() {
+        Backend backend;
+        const QVariantList rows = backend.actionRows();
+        QVERIFY(rows.size() >= 40);
+
+        QHash<QString, QVariantMap> byId;
+        for (const QVariant &value : rows) {
+            const QVariantMap row = value.toMap();
+            const QString id = row.value(QStringLiteral("id")).toString();
+            QVERIFY(!id.isEmpty());
+            QVERIFY(!row.value(QStringLiteral("label")).toString().isEmpty());
+            byId.insert(id, row);
+        }
+        const auto keys = [&byId](const QString &id) {
+            return byId.value(id).value(QStringLiteral("sequences")).toStringList();
+        };
+
+        QCOMPARE(keys(QStringLiteral("command-palette")),
+                 (QStringList{QStringLiteral("Ctrl+P")}));
+        QCOMPARE(keys(QStringLiteral("open-file")),
                  (QStringList{QStringLiteral("Ctrl+O")}));
+        QCOMPARE(keys(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+B")}));
+        QCOMPARE(keys(QStringLiteral("bold")),
+                 (QStringList{QStringLiteral("Ctrl+Alt+B")}));
+        QCOMPARE(keys(QStringLiteral("backlinks")),
+                 (QStringList{QStringLiteral("Ctrl+Shift+B")}));
+        QCOMPARE(keys(QStringLiteral("print")),
+                 (QStringList{QStringLiteral("Ctrl+Shift+P")}));
+        QCOMPARE(keys(QStringLiteral("quick-open")),
+                 (QStringList{QStringLiteral("Ctrl+Shift+O")}));
+        QCOMPARE(keys(QStringLiteral("save")), (QStringList{QStringLiteral("Ctrl+S")}));
+        QCOMPARE(keys(QStringLiteral("save-as")),
+                 (QStringList{QStringLiteral("Ctrl+Shift+S")}));
+        QCOMPARE(keys(QStringLiteral("close-tab")),
+                 (QStringList{QStringLiteral("Ctrl+W")}));
+
+        // The palette's commands without keys still have rows, but the
+        // settings dialog must not offer them for rebinding.
+        QVERIFY(byId.contains(QStringLiteral("settings")));
+        QVERIFY(byId.contains(QStringLiteral("font")));
+        QVERIFY(keys(QStringLiteral("settings")).isEmpty());
+        QVERIFY(keys(QStringLiteral("font")).isEmpty());
+        QVERIFY(!byId.value(QStringLiteral("settings"))
+                     .value(QStringLiteral("hasKeys")).toBool());
+
+        int keyed = 0;
+        for (const QVariant &value : rows) {
+            if (value.toMap().value(QStringLiteral("hasKeys")).toBool())
+                ++keyed;
+        }
+        QCOMPARE(backend.shortcutRows().size(), keyed);
+        for (const QVariant &value : backend.shortcutRows()) {
+            const QVariantMap row = value.toMap();
+            QVERIFY(!row.value(QStringLiteral("sequence")).toString().isEmpty());
+            QCOMPARE(row.value(QStringLiteral("label")).toString(),
+                     backend.shortcutDescription(row.value(QStringLiteral("id")).toString()));
+        }
+
+        // Live keys follow an override in the same row shape.
+        QVERIFY(backend.setShortcut(QStringLiteral("bold"),
+                                    QStringLiteral("Ctrl+Alt+Shift+B")));
+        QVariantMap boldRow;
+        for (const QVariant &value : backend.actionRows()) {
+            if (value.toMap().value(QStringLiteral("id")).toString()
+                    == QStringLiteral("bold"))
+                boldRow = value.toMap();
+        }
+        QCOMPARE(boldRow.value(QStringLiteral("sequences")).toStringList(),
+                 (QStringList{QStringLiteral("Ctrl+Alt+Shift+B")}));
+        QCOMPARE(boldRow.value(QStringLiteral("defaults")).toStringList(),
+                 (QStringList{QStringLiteral("Ctrl+Alt+B")}));
+        QVERIFY(!boldRow.value(QStringLiteral("isDefault")).toBool());
+        backend.resetShortcut(QStringLiteral("bold"));
+    }
+
+    void shortcutsReferenceReadsTheActionRegistry() {
+        // There is no second key table left in the dialog: the reference is a
+        // view of backend.shortcutRows(), the same registry Settings edits.
+        const QString dialogQmlPath = QFINDTESTDATA("../src/ShortcutsDialog.qml");
+        QVERIFY(!dialogQmlPath.isEmpty());
+        QFile source(dialogQmlPath);
+        QVERIFY(source.open(QIODevice::ReadOnly));
+        const QByteArray dialogSource = source.readAll();
+        QVERIFY(!dialogSource.contains("fixedShortcuts"));
+        QVERIFY(!dialogSource.contains("editorShortcuts"));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+
+        QObject *dialog = window->findChild<QObject *>(QStringLiteral("shortcutsDialog"));
+        QVERIFY(dialog);
+        QVERIFY(QMetaObject::invokeMethod(dialog, "open"));
+        QTRY_VERIFY(dialog->property("opened").toBool());
+
+        const QVariantList live = dialog->property("shortcuts").toList();
+        QCOMPARE(live.size(), backend.shortcutRows().size());
+        QStringList labels;
+        QStringList keys;
+        for (const QVariant &value : live) {
+            labels.append(value.toMap().value(QStringLiteral("desc")).toString());
+            keys.append(value.toMap().value(QStringLiteral("key")).toString());
+        }
+        QVERIFY(labels.contains(QStringLiteral("Command Palette")));
+        QVERIFY(labels.contains(QStringLiteral("Open File")));
+        QVERIFY(labels.contains(QStringLiteral("Bold")));
+        QVERIFY(keys.contains(QStringLiteral("Ctrl+P")));
+        QVERIFY(keys.contains(QStringLiteral("Ctrl+O")));
+        QVERIFY(keys.contains(QStringLiteral("Ctrl+Alt+B")));
+        QVERIFY(!keys.contains(QString()));
+    }
+
+    void openFileKeySignalsTheDialog() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *openShortcut = window->findChild<QObject *>(QStringLiteral("openFileShortcut"));
+        QVERIFY(openShortcut);
+        QCOMPARE(openShortcut->property("sequence").toString(), QStringLiteral("Ctrl+O"));
+
+        QSignalSpy openDialogSpy(&backend, &Backend::openDialogRequested);
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTRY_COMPARE(openDialogSpy.count(), 1);
+    }
+
+    void printKeyIsShiftedOffThePalette() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *printShortcut = window->findChild<QObject *>(QStringLiteral("printShortcut"));
+        QObject *paletteShortcut =
+            window->findChild<QObject *>(QStringLiteral("commandPaletteShortcut"));
+        QVERIFY(printShortcut);
+        QVERIFY(paletteShortcut);
+        QCOMPARE(printShortcut->property("sequence").toString(),
+                 QStringLiteral("Ctrl+Shift+P"));
+        QCOMPARE(paletteShortcut->property("sequence").toString(), QStringLiteral("Ctrl+P"));
+
+        // Ctrl+P opens the palette rather than printing.
+        QTest::keyClick(window, Qt::Key_P, Qt::ControlModifier);
+        QTRY_VERIFY(window->findChild<QObject *>(QStringLiteral("commandPalette"))
+                        ->property("visible").toBool());
     }
 
     void scrollSpeedDefaultsToDoubleAndPersists() {

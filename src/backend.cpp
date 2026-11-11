@@ -127,22 +127,26 @@ constexpr double defaultScrollSpeed = 2.0;
 constexpr double minScrollSpeed = 0.25;
 constexpr double maxScrollSpeed = 4.0;
 
-// Every rebindable action: the id QML binds to, the label the dialogs show,
-// and the sequences a fresh settings file behaves as. The settings dialog and
-// the shortcuts reference both read this table, so it is the only place that
-// names a default key.
-struct ShortcutDef {
+// Every action the app knows: the stable id QML dispatches on, the label the
+// command palette and the dialogs show, and the sequences a fresh settings file
+// behaves as. An action with no defaults (Settings, Font) still appears in the
+// palette; it just has no key to edit. The settings dialog, the shortcuts
+// reference, and every Shortcut item read this table, so it is the only place
+// that names a default key.
+struct ActionDef {
     const char *id;
-    const char *description;
+    const char *label;
     // A vector, not an initializer_list: the list's backing array would be a
     // temporary, dangling once this static table is built.
     std::vector<const char *> defaults;
 };
 
-static const QList<ShortcutDef> shortcutDefs = {
+static const QList<ActionDef> actionDefs = {
     {"save", "Save", {"Ctrl+S"}},
     {"save-as", "Save As", {"Ctrl+Shift+S"}},
-    {"toggle-sidebar", "File Viewer (Show / Hide)", {"Ctrl+O"}},
+    {"open-file", "Open File", {"Ctrl+O"}},
+    {"command-palette", "Command Palette", {"Ctrl+P"}},
+    {"toggle-sidebar", "File Viewer (Show / Hide)", {"Ctrl+B"}},
     {"quick-open", "Open Other File", {"Ctrl+Shift+O"}},
     {"tab-1", "Go to Tab 1", {"Ctrl+1"}},
     {"tab-2", "Go to Tab 2", {"Ctrl+2"}},
@@ -160,7 +164,7 @@ static const QList<ShortcutDef> shortcutDefs = {
     {"forward", "Forward to Next File", {"Alt+Right", "Alt+]"}},
     {"backlinks", "Linked Mentions (Backlinks)", {"Ctrl+Shift+B"}},
     {"new-window", "New Window", {"Ctrl+N"}},
-    {"print", "Print", {"Ctrl+P"}},
+    {"print", "Print", {"Ctrl+Shift+P"}},
     {"copy-html", "Copy as HTML", {"Ctrl+Shift+C"}},
     {"fullscreen", "Fullscreen", {"Meta+F", "F11"}},
     {"undo", "Undo", {"Ctrl+Z"}},
@@ -168,7 +172,7 @@ static const QList<ShortcutDef> shortcutDefs = {
     {"find", "Find", {"Ctrl+F"}},
     {"find-replace", "Find & Replace", {"Ctrl+H"}},
     {"find-next", "Next Match in Find", {"Ctrl+G"}},
-    {"bold", "Bold", {"Ctrl+B"}},
+    {"bold", "Bold", {"Ctrl+Alt+B"}},
     {"italic", "Italic", {"Ctrl+I"}},
     {"strikethrough", "Strikethrough", {"Ctrl+Shift+X"}},
     {"insert-link", "Insert Link", {"Ctrl+K"}},
@@ -178,6 +182,8 @@ static const QList<ShortcutDef> shortcutDefs = {
     {"zoom-out", "Decrease Text Size", {"Ctrl+-"}},
     {"zoom-reset", "Reset Text Size", {"Ctrl+0"}},
     {"shortcuts-dialog", "Shortcuts", {"Ctrl+?", "Ctrl+/", "F1"}},
+    {"settings", "Settings", {}},
+    {"font", "Font", {}},
 };
 
 static QString shortcutSettingsKey(const QString &id) {
@@ -603,21 +609,23 @@ void Backend::setTreeMode(const QString &mode) {
 
 QStringList Backend::shortcutIds() const {
     QStringList ids;
-    for (const ShortcutDef &def : shortcutDefs)
-        ids.append(QString::fromLatin1(def.id));
+    for (const ActionDef &def : actionDefs) {
+        if (!def.defaults.empty())
+            ids.append(QString::fromLatin1(def.id));
+    }
     return ids;
 }
 
 QString Backend::shortcutDescription(const QString &id) const {
-    for (const ShortcutDef &def : shortcutDefs) {
+    for (const ActionDef &def : actionDefs) {
         if (id == QString::fromLatin1(def.id))
-            return QString::fromLatin1(def.description);
+            return QString::fromLatin1(def.label);
     }
     return {};
 }
 
 QStringList Backend::shortcutDefaults(const QString &id) const {
-    for (const ShortcutDef &def : shortcutDefs) {
+    for (const ActionDef &def : actionDefs) {
         if (id != QString::fromLatin1(def.id))
             continue;
         QStringList defaults;
@@ -670,20 +678,43 @@ void Backend::resetShortcut(const QString &id) {
 }
 
 void Backend::resetAllShortcuts() {
-    for (const ShortcutDef &def : shortcutDefs)
+    for (const ActionDef &def : actionDefs)
         QSettings().remove(shortcutSettingsKey(QString::fromLatin1(def.id)));
     emit shortcutsChanged();
 }
 
+QVariantList Backend::actionRows() const {
+    QVariantList rows;
+    for (const ActionDef &def : actionDefs) {
+        const QString id = QString::fromLatin1(def.id);
+        const QStringList sequences = shortcutSequences(id);
+        const QStringList defaults = shortcutDefaults(id);
+        rows.append(QVariantMap{
+            {QStringLiteral("id"), id},
+            {QStringLiteral("label"), QString::fromLatin1(def.label)},
+            {QStringLiteral("sequence"), sequences.join(QStringLiteral(", "))},
+            {QStringLiteral("sequences"), sequences},
+            {QStringLiteral("defaults"), defaults},
+            {QStringLiteral("hasKeys"), !defaults.isEmpty()},
+            {QStringLiteral("isDefault"), sequences == defaults}});
+    }
+    return rows;
+}
+
 QVariantList Backend::shortcutRows() const {
     QVariantList rows;
-    for (const ShortcutDef &def : shortcutDefs) {
+    for (const ActionDef &def : actionDefs) {
+        // Non-key actions belong in the palette but cannot be rebound, so the
+        // settings dialog and the shortcut reference leave them out.
+        if (def.defaults.empty())
+            continue;
         const QString id = QString::fromLatin1(def.id);
         const QStringList sequences = shortcutSequences(id);
         rows.append(QVariantMap{
             {QStringLiteral("id"), id},
-            {QStringLiteral("description"), QString::fromLatin1(def.description)},
+            {QStringLiteral("label"), QString::fromLatin1(def.label)},
             {QStringLiteral("sequence"), sequences.join(QStringLiteral(", "))},
+            {QStringLiteral("sequences"), sequences},
             {QStringLiteral("isDefault"),
              sequences == shortcutDefaults(id)}});
     }
@@ -692,7 +723,7 @@ QVariantList Backend::shortcutRows() const {
 
 QVariantMap Backend::shortcutMap() const {
     QVariantMap map;
-    for (const ShortcutDef &def : shortcutDefs) {
+    for (const ActionDef &def : actionDefs) {
         const QString id = QString::fromLatin1(def.id);
         map.insert(id, shortcutSequences(id));
     }

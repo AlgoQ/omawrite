@@ -12,6 +12,7 @@
         <file alias="ImageViewerButton.qml">ImageViewerButton.qml</file>
         <file alias="TreeHeaderButton.qml">TreeHeaderButton.qml</file>
         <file alias="SettingsDialog.qml">SettingsDialog.qml</file>
+        <file alias="CommandPalette.qml">CommandPalette.qml</file>
         <file alias="EditorMutations.js">EditorMutations.js</file>
         <file alias="fonts/IBMPlexMono-Regular.ttf">../fonts/IBMPlexMono-Regular.ttf</file>
         <file alias="fonts/IBMPlexMono-Italic.ttf">../fonts/IBMPlexMono-Italic.ttf</file>

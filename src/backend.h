@@ -152,8 +152,9 @@ public:
     Q_INVOKABLE bool removeProperty(const QString &key);
     // Rebindable keys. shortcutSequences falls back to the built-in defaults
     // until setShortcut stores an override; resetShortcut drops it again.
-    // shortcutRows feeds the settings and shortcuts dialogs: one map per
-    // action with its id, description, and sequences joined for display.
+    // actionRows feeds the command palette: every action with its label, live
+    // sequences, and defaults. shortcutRows is the same registry narrowed to
+    // actions that have keys, for the settings and shortcuts dialogs.
     bool hasProperties() const { return !m_frontmatter.isEmpty(); }
     QVariantList documentProperties() const;
     Q_INVOKABLE QStringList shortcutIds() const;
@@ -163,6 +164,7 @@ public:
     Q_INVOKABLE bool setShortcut(const QString &id, const QString &text);
     Q_INVOKABLE void resetShortcut(const QString &id);
     Q_INVOKABLE void resetAllShortcuts();
+    Q_INVOKABLE QVariantList actionRows() const;
     Q_INVOKABLE QVariantList shortcutRows() const;
     double scrollSpeed() const { return m_scrollSpeed; }
     void setScrollSpeed(double speed);

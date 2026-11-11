@@ -22,7 +22,8 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
 
 - `Ctrl+S` saves. Unsaved documents use the XDG desktop portal file picker.
 - `Ctrl+Shift+S` saves as.
-- `Ctrl+O` shows or hides the file viewer beside the page, in the page's own
+- `Ctrl+O` opens the file picker for a note anywhere on disk.
+- `Ctrl+B` shows or hides the file viewer beside the page, in the page's own
   background; it also opens by itself when Omawrite starts without a file.
   Links mode (the default) nests notes the way Obsidian's VirtFolder does:
   under the notes their `up:` frontmatter field names, orphans as roots, with
@@ -31,7 +32,13 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
   it in a tab, or use the arrow keys and `Enter`; `←`/`→` fold and unfold,
   `«` in the header and `Esc` close the tree. "Open another location…" at its
   foot opens the portal picker for files outside the tree.
-- `Ctrl+Shift+O` opens a searchable list of the other notes in the slipbox.
+- `Ctrl+P` opens the command palette: one search box over every action and
+  every note in the slipbox. `↑`/`↓`, `Page Up`/`Page Down`, `Enter`, and
+  `Esc` work it from the field; a `CMD` or `FILE` badge says which kind a row
+  is. Commands run the same handler as their keyboard shortcut, and file rows
+  open in a tab.
+- `Ctrl+Shift+O` opens the command palette in file-only mode, the searchable
+  list of the other notes in the slipbox.
 - `Ctrl+Shift+B` toggles a Linked mentions panel listing the notes that link to
   the open one, with the lines that do. Click a note to open it.
 - Following a link (`Ctrl+Click` or `Ctrl+Enter`) or picking a note from
@@ -43,13 +50,13 @@ Install via the Omarchy Package Repository via the `omawrite` package. It's inst
 - `Alt+Left` and `Alt+Right` go back and forward through the files opened in
   the window, tab switches included. The arrows at the left of the footer do
   the same and dim when there is nowhere to go.
-- `Ctrl+P` opens the system print dialog.
+- `Ctrl+Shift+P` opens the system print dialog.
 - `Ctrl+N` opens a new Omawrite window.
 - `Ctrl+Z`, `Ctrl+Shift+Z`, and `Ctrl+Y` handle undo and redo.
 - `Super+F` toggles fullscreen. Qt maps this key as `Meta+F`.
 - `Ctrl+F` searches the document. Use `Enter` or `Ctrl+G` for the next match and `Shift+Enter` for the previous match.
 - `Ctrl+H` opens find and replace.
-- `Ctrl+B`, `Ctrl+I`, and `Ctrl+Shift+X` toggle bold, italic, and strikethrough Markdown. `Ctrl+K` inserts a link.
+- `Ctrl+Alt+B`, `Ctrl+I`, and `Ctrl+Shift+X` toggle bold, italic, and strikethrough Markdown. `Ctrl+K` inserts a link.
 - `- [ ]` and `- [x]` are task items. Their checkbox is drawn in place of the
   marker, and a click toggles it. `Ctrl+Shift+Enter` toggles the item at the
   caret. `Enter` on a task continues the list with a fresh checkbox, and

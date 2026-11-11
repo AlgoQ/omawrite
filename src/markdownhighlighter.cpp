@@ -589,7 +589,7 @@ QList<MarkdownHighlighter::InlineMarkup> MarkdownHighlighter::inlineMarkup(const
         return true;
     };
 
-    // "***word***" is bold and italic at once, as Ctrl+B then Ctrl+I writes it:
+    // "***word***" is bold and italic at once, as Ctrl+Alt+B then Ctrl+I writes it:
     // the outer two asterisks of each run are bold, the inner one italic. Its
     // runs are then masked so the patterns below do not split them again.
     QString unclaimed = text;
