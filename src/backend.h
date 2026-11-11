@@ -9,6 +9,7 @@
 #include <QStringList>
 #include <QTimer>
 #include <QHash>
+#include <QPair>
 #include <QSize>
 #include <QUrl>
 #include <QVariantList>
@@ -141,6 +142,13 @@ public:
     Q_INVOKABLE QUrl imageUrlAt(int position) const;
     Q_INVOKABLE void openImage(const QUrl &url);
     Q_INVOKABLE void setImageAreaWidth(int width);
+    // The blocks the editor draws as themselves rather than as Markdown:
+    // tables today, each with the rows, alignment and measured geometry the
+    // QML overlay needs. Later block kinds join this same list.
+    Q_INVOKABLE QVariantList renderedBlocks() const;
+    // The writing column's width for rendered blocks. Block formats reserve
+    // their height from it, so it is measured again when the column changes.
+    Q_INVOKABLE void setTableAreaWidth(int width);
     Q_INVOKABLE QVariantMap emphasisSpanAt(int position, const QString &marker) const;
     // Properties editing. Each rewrite touches only the named key's lines and
     // keeps the rest of the frontmatter, comments and order included.
@@ -224,6 +232,9 @@ private:
                          QSize *natural = nullptr) const;
     qreal blockImageMargin(const QTextBlock &block) const;
     int imagePadding() const;
+    // The width a rendered block is drawn at: the writing column once QML has
+    // measured it, then the document's own width, then a sane fallback.
+    int blockAreaWidth() const;
     qreal steppedTextZoom(int direction) const;
     void setTextZoom(qreal zoom);
     void setFileUrl(const QUrl &url);
@@ -307,6 +318,11 @@ private:
     mutable QHash<QString, QString> m_imagePaths;
     mutable QHash<QString, QSize> m_imageSizes;
     int m_imageAreaWidth = 0;
+    int m_tableAreaWidth = 0;
+    // The block ranges tables occupied after the last geometry pass. An edit
+    // that dissolves a table still has to clear the margins and hidden styles
+    // its old lines carried, so they are remembered here.
+    QList<QPair<int, int>> m_tableBlockRanges;
 
     QString m_themeBackground;
     QString m_themeForeground;

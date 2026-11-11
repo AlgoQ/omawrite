@@ -1853,7 +1853,12 @@ ApplicationWindow {
                     caretRevision++;
                     win.refreshWikiPopup();
                 }
-                onFontChanged: backend.documentFontChanged()
+                onFontChanged: {
+                    backend.documentFontChanged();
+                    // The overlay's row heights and column widths were measured
+                    // with the old font, and Backend has just re-measured them.
+                    refreshRenderedBlocks();
+                }
                 onActiveFocusChanged: if (!activeFocus) win.closeWikiPopup()
 
                 // One edit command, so a single undo takes the change back.
@@ -1883,6 +1888,13 @@ ApplicationWindow {
                         imageModel.remove(images.length, imageModel.count - images.length);
                 }
 
+                // The blocks Backend can draw as themselves: tables today.
+                // Replaced whole because a table's rows and measure change
+                // together with the text.
+                function refreshRenderedBlocks() {
+                    renderedBlocks = backend.renderedBlocks();
+                }
+
                 // The widest an image is drawn: the writing column at full
                 // width. A narrower window scales images down to fit.
                 readonly property int imageAreaWidth:
@@ -1891,6 +1903,17 @@ ApplicationWindow {
                     backend.setImageAreaWidth(imageAreaWidth);
                     refreshImages();
                 }
+
+                // Rendered blocks are measured against the editor's own width,
+                // which can be narrower than imageAreaWidth in a small window.
+                onWidthChanged: {
+                    backend.setTableAreaWidth(Math.round(width));
+                    refreshRenderedBlocks();
+                }
+
+                // Block geometry comes from Backend, so a font or size change
+                // has to ask for it again after the document is remeasured.
+                property var renderedBlocks: []
 
                 ListModel {
                     id: imageModel
@@ -2255,6 +2278,7 @@ ApplicationWindow {
                     hoveredLinkUrl = "";
                     refreshTaskMarkers();
                     refreshImages();
+                    refreshRenderedBlocks();
                     // The document re-lays out after this signal; remeasure
                     // the checkboxes once it has.
                     Qt.callLater(function() { caretRevision++; });
@@ -2494,11 +2518,118 @@ ApplicationWindow {
                     }
                 }
 
+                // A table's raw lines are hidden by the highlighter while the
+                // caret is outside it, and Backend has reserved the drawn
+                // table's height below the source lines. This draws the table
+                // in that room. The same list carries the seam for later
+                // blocks: a kind gets a delegate here.
+                Repeater {
+                    objectName: "renderedBlockOverlays"
+                    model: editor.renderedBlocks
+
+                    delegate: Rectangle {
+                        id: tableOverlay
+                        objectName: "tableOverlay"
+                        required property var modelData
+                        required property int index
+
+                        readonly property var block: modelData
+                        readonly property bool editing:
+                            editor.cursorPosition >= block.blockStart
+                            && editor.cursorPosition <= block.blockEnd
+                        readonly property rect anchor: {
+                            // The document re-lays out after a style change;
+                            // these make the overlay measure once it has.
+                            var revision = editor.caretRevision;
+                            var contentHeight = editor.contentHeight;
+                            return editor.positionToRectangle(block.blockStart);
+                        }
+
+                        visible: block.kind === "table" && !editing
+                        x: 0
+                        y: Math.round(anchor.y)
+                        width: block.kind === "table" ? block.width : 0
+                        height: block.kind === "table" ? block.height : 0
+                        color: "transparent"
+                        border.width: 1
+                        border.color: win.darkMode ? "#3f3f3a" : "#d9d8c8"
+                        radius: win.scaledSize(3)
+                        clip: true
+                        z: 1
+
+                        Column {
+                            anchors.fill: parent
+
+                            Repeater {
+                                model: tableOverlay.block.rows
+
+                                delegate: Item {
+                                    id: tableRow
+                                    objectName: "tableOverlayRow"
+                                    required property var modelData
+
+                                    width: tableOverlay.width
+                                    height: tableRow.modelData.height
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        visible: tableRow.modelData.header
+                                        color: win.darkMode ? "#14ffffff" : "#08000000"
+                                    }
+
+                                    Row {
+                                        anchors.fill: parent
+
+                                        Repeater {
+                                            model: tableRow.modelData.cells
+
+                                            delegate: Text {
+                                                required property var modelData
+                                                required property int index
+
+                                                width: tableOverlay.block.columnWidths[index]
+                                                height: tableRow.height
+                                                text: modelData
+                                                textFormat: Text.PlainText
+                                                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                                verticalAlignment: Text.AlignVCenter
+                                                leftPadding: tableOverlay.block.cellPadding
+                                                rightPadding: tableOverlay.block.cellPadding
+                                                color: win.textColor
+                                                font.family: backend.editorFont
+                                                font.pixelSize: win.editorFontPixelSize
+                                                font.bold: tableRow.modelData.header
+                                                horizontalAlignment: {
+                                                    var alignment =
+                                                        tableOverlay.block.alignments[index];
+                                                    return alignment === "center" ? Text.AlignHCenter
+                                                        : alignment === "right" ? Text.AlignRight
+                                                        : Text.AlignLeft;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.bottom: parent.bottom
+                                        height: 1
+                                        color: win.darkMode ? "#2e2e2a" : "#e4e2d4"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Component.onCompleted: {
                     backend.setImageAreaWidth(imageAreaWidth);
+                    backend.setTableAreaWidth(Math.round(width));
                     backend.attachDocument(textDocument);
                     refreshTaskMarkers();
                     refreshImages();
+                    refreshRenderedBlocks();
                     forceActiveFocus();
                 }
             }

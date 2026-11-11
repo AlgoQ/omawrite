@@ -1,5 +1,7 @@
 #pragma once
 
+#include "blockrenderer.h"
+
 #include <QRegularExpression>
 #include <QSyntaxHighlighter>
 #include <QTextCharFormat>
@@ -18,6 +20,10 @@ public:
     void setSearch(const QString &query, int currentMatchStart);
     void setCaret(int position);
     void refreshFont();
+    // Re-parses rendered blocks and restyles them. Backend calls this after an
+    // edit so a table that just formed, or dissolved, is hidden or shown as a
+    // whole rather than one line at a time.
+    void refreshTables();
 
     struct Span {
         int start;
@@ -98,6 +104,11 @@ private:
     void highlightMarkers(const QString &text);
     void highlightInline(const QString &text);
     void highlightSearch(const QString &text);
+    // Tables the editor draws as themselves. Parsed once per document
+    // revision and asked for by every line the highlighter styles.
+    const QList<BlockRenderer::Table> &tables();
+    BlockRenderer::Table tableForBlock(const QTextBlock &block);
+    void rehighlightTable(const BlockRenderer::Table &table);
 
     bool m_darkMode = true;
     QString m_customBackground;
@@ -106,6 +117,10 @@ private:
     QString m_customCodeBackground;
     QTextCharFormat m_markerFormat;
     QTextCharFormat m_hiddenMarkerFormat;
+    // Hides a rendered block's source lines without changing their height.
+    // Tables keep that height so the page does not reflow when the caret
+    // enters or leaves them.
+    QTextCharFormat m_hiddenLineFormat;
     // Hides a task marker while reserving the width of its drawn checkbox.
     QTextCharFormat m_taskMarkerFormat;
     QTextCharFormat m_headingFormat;
@@ -125,4 +140,6 @@ private:
     QTextCursor m_caret;
     QTextCharFormat m_searchFormat;
     QTextCharFormat m_currentSearchFormat;
+    QList<BlockRenderer::Table> m_tables;
+    int m_tablesRevision = -1;
 };

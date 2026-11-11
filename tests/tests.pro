@@ -7,10 +7,12 @@ INCLUDEPATH += ../src
 SOURCES += \
     tst_omawrite.cpp \
     ../src/backend.cpp \
+    ../src/blockrenderer.cpp \
     ../src/cli.cpp \
     ../src/markdownhighlighter.cpp
 HEADERS += \
     ../src/backend.h \
+    ../src/blockrenderer.h \
     ../src/cli.h \
     ../src/markdownhighlighter.h
 
