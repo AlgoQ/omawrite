@@ -30,10 +30,14 @@ ApplicationWindow {
     readonly property int footerHeight: scaledSize(32)
     // Never wider than the Flickable's viewport, whatever the floor asks for:
     // a tiling compositor can resize the window below its minimum width.
+    // The side panels take room from the page rather than covering it.
+    readonly property int sidebarWidth: sidebarOpen ? Math.min(scaledSize(280), Math.round(width * 0.3)) : 0
+    readonly property int backlinksWidth: backlinksOpen ? Math.min(scaledSize(380), Math.round(width * 0.45)) : 0
+    readonly property int pageWidth: width - sidebarWidth - backlinksWidth
     readonly property int editorWidth: Math.min(
         Math.round(writerFontMetrics.averageCharacterWidth * 65),
-        Math.max(360, width - Math.round(writerFontMetrics.averageCharacterWidth * 20)),
-        Math.max(0, width - 48))
+        Math.max(360, pageWidth - Math.round(writerFontMetrics.averageCharacterWidth * 20)),
+        Math.max(0, pageWidth - 48))
     property bool closeConfirmed: false
     property bool searchOpen: false
     property bool searchUpdating: false
@@ -43,6 +47,9 @@ ApplicationWindow {
     property string pendingAction: ""
     property bool replaceOpen: false
     property bool awaitingPendingSave: false
+    // The picture viewer's shot of the note's images, in document order.
+    property var viewerImages: []
+    property int viewerIndex: -1
 
     Material.theme: darkMode ? Material.Dark : Material.Light
     Material.accent: backend.themeAccent
@@ -79,6 +86,455 @@ ApplicationWindow {
         }
     }
 
+    function followLinkAt(position) {
+        var image = backend.imageUrlAt(position);
+        if (image.toString().length > 0) {
+            backend.openImage(image);
+            return true;
+        }
+
+        var wiki = backend.wikiLinkAt(position);
+        if (wiki.kind === "file") {
+            openInTab(wiki.url);
+            return true;
+        }
+        if (wiki.kind === "missing") {
+            backend.reportMissingNote(wiki.target);
+            return false;
+        }
+
+        var url = backend.linkUrlAt(position);
+        if (url.length > 0) {
+            backend.openExternalUrl(url);
+            return true;
+        }
+        return false;
+    }
+
+    // The viewer is handed a fresh list of the note's pictures and the one
+    // whose block was clicked, so an embed moved by typing still opens the
+    // picture under the pointer.
+    function openImageViewer(blockStart) {
+        var images = backend.imageEmbeds();
+        for (var i = 0; i < images.length; ++i) {
+            if (images[i].blockStart === blockStart) {
+                viewerImages = images;
+                viewerIndex = i;
+                imageViewer.open();
+                return;
+            }
+        }
+    }
+
+    function stepImageViewer(direction) {
+        var next = viewerIndex + direction;
+        if (next < 0 || next >= viewerImages.length)
+            return;
+        viewerIndex = next;
+    }
+
+    function closeImageViewer() {
+        // Close on the picture that was last shown, leaving its raw embed
+        // under the caret so it can be edited or deleted straight away.
+        if (viewerIndex >= 0 && viewerIndex < viewerImages.length)
+            editor.cursorPosition = viewerImages[viewerIndex].blockEnd;
+        imageViewer.close();
+        editor.forceActiveFocus();
+    }
+
+    // The unfinished [[link]] around the caret, if there is one. A newline, a
+    // closing bracket, an alias or a heading ends the search. Only the tail
+    // near the caret is read, so this stays cheap in a long document.
+    function wikiContext() {
+        var from = Math.max(0, editor.cursorPosition - 256);
+        var tail = editor.getText(from, editor.cursorPosition);
+        var open = tail.lastIndexOf("[[");
+        if (open < 0)
+            return null;
+        var query = tail.slice(open + 2);
+        if (query.indexOf("]]") >= 0 || query.indexOf("\n") >= 0
+                || query.indexOf("[[") >= 0 || query.indexOf("|") >= 0
+                || query.indexOf("#") >= 0 || backend.insideFence(editor.cursorPosition))
+            return null;
+        return { start: from + open, query: query };
+    }
+
+    function closeWikiPopup() {
+        wikiPopup.visible = false;
+        wikiPopup.suggestions = [];
+        wikiPopup.currentIndex = 0;
+        wikiPopup.query = "";
+    }
+
+    function refreshWikiPopup() {
+        var context = wikiContext();
+        if (!context || !editor.activeFocus) {
+            closeWikiPopup();
+            return;
+        }
+
+        if (!wikiPopup.visible)
+            backend.refreshNoteIndex();
+        var suggestions = backend.noteSuggestions(context.query);
+        if (suggestions.length === 0) {
+            closeWikiPopup();
+            return;
+        }
+
+        if (wikiPopup.query !== context.query) {
+            wikiPopup.query = context.query;
+            wikiPopup.currentIndex = 0;
+        }
+        wikiPopup.replaceStart = context.start;
+        wikiPopup.suggestions = suggestions;
+        wikiPopup.visible = true;
+        positionWikiPopup();
+    }
+
+    function positionWikiPopup() {
+        if (!wikiPopup.visible)
+            return;
+        var rect = editor.cursorRectangle;
+        var point = editor.mapToItem(rootItem, rect.x, rect.y + rect.height + 4);
+        var popupWidth = Math.min(scaledSize(420), width - 48);
+        var popupHeight = wikiPopup.height;
+        var x = Math.max(24, Math.min(point.x, width - popupWidth - 24));
+        var y = point.y;
+        if (y + popupHeight > height - footerHeight - 8) {
+            var above = editor.mapToItem(rootItem, rect.x, rect.y).y;
+            y = Math.max(8, above - popupHeight - 4);
+        }
+        wikiPopup.x = x;
+        wikiPopup.y = y;
+        wikiPopup.width = popupWidth;
+    }
+
+    function acceptWikiSuggestion(index) {
+        if (!wikiPopup.visible || index < 0 || index >= wikiPopup.suggestions.length)
+            return;
+        var context = wikiContext();
+        if (!context) {
+            closeWikiPopup();
+            return;
+        }
+
+        var start = context.start;
+        var end = editor.cursorPosition;
+        if (editor.text.slice(end, end + 2) === "]]")
+            end += 2;
+        var replacement = "[[" + wikiPopup.suggestions[index].insert + "]]";
+        backend.replaceRange(start, end, replacement);
+        editor.cursorPosition = start + replacement.length;
+        closeWikiPopup();
+        editor.forceActiveFocus();
+    }
+
+    // The file viewer: a VirtFolder-style link tree of the vault ("Links",
+    // nested by each note's up: field) or a folder tree of the disk
+    // ("Folders"). Rows are rebuilt from disk each time something expands,
+    // the mode changes, or the note changes.
+    property bool sidebarOpen: false
+    property var expandedFolders: ({})
+    property var linksExpanded: ({})
+    property var treeRows: []
+
+    function rebuildTree() {
+        if (!sidebarOpen)
+            return;
+        if (backend.treeMode === "folders")
+            rebuildFolderTree();
+        else
+            rebuildLinkTree();
+        highlightCurrentInTree();
+    }
+
+    function rebuildFolderTree() {
+        var rows = [];
+        var walk = function(relative, depth) {
+            var entries = backend.listFolder(relative);
+            for (var i = 0; i < entries.length; ++i) {
+                var entry = entries[i];
+                rows.push({ name: entry.name, path: entry.path, url: entry.url,
+                            isDir: entry.isDir, hasChildren: entry.isDir,
+                            childCount: 0, depth: depth,
+                            expanded: entry.isDir && expandedFolders[entry.path] === true });
+                if (entry.isDir && expandedFolders[entry.path] === true)
+                    walk(entry.path, depth + 1);
+            }
+        };
+        walk("", 0);
+        treeRows = rows;
+    }
+
+    // Flattens the nested link tree, hiding the children of folded notes.
+    function rebuildLinkTree() {
+        var rows = [];
+        var walk = function(nodes, depth) {
+            for (var i = 0; i < nodes.length; ++i) {
+                var node = nodes[i];
+                var open = linksExpanded[node.path] === true;
+                rows.push({ name: node.name, path: node.path, url: node.url,
+                            isDir: false, hasChildren: node.children.length > 0,
+                            childCount: node.childCount, tags: node.tags,
+                            depth: depth, expanded: open });
+                if (open)
+                    walk(node.children, depth + 1);
+            }
+        };
+        walk(backend.virtFolderTree(), 0);
+        treeRows = rows;
+    }
+
+    function highlightCurrentInTree() {
+        var current = backend.fileTreeCurrentPath();
+        for (var i = 0; i < treeRows.length; ++i) {
+            if (!treeRows[i].isDir && treeRows[i].path === current) {
+                sidebarList.currentIndex = i;
+                return;
+            }
+        }
+    }
+
+    // Opens the way to the open note, so it can be seen in the tree: its
+    // folders in folder mode, its ancestors in link mode.
+    function revealCurrentInTree() {
+        var current = backend.fileTreeCurrentPath();
+        if (current === "")
+            return;
+        if (backend.treeMode === "folders") {
+            var parts = current.split("/");
+            var expanded = Object.assign({}, expandedFolders);
+            var path = "";
+            for (var i = 0; i < parts.length - 1; ++i) {
+                path = path === "" ? parts[i] : path + "/" + parts[i];
+                expanded[path] = true;
+            }
+            expandedFolders = expanded;
+            return;
+        }
+        var trail = linkAncestors(backend.virtFolderTree(), current, []);
+        if (trail === null)
+            return;
+        var open = Object.assign({}, linksExpanded);
+        for (var j = 0; j < trail.length; ++j)
+            open[trail[j]] = true;
+        linksExpanded = open;
+    }
+
+    // The paths above the target in the nested link tree, or null.
+    function linkAncestors(nodes, target, trail) {
+        for (var i = 0; i < nodes.length; ++i) {
+            if (nodes[i].path === target)
+                return trail;
+            var deeper = linkAncestors(nodes[i].children, target,
+                                       trail.concat([nodes[i].path]));
+            if (deeper !== null)
+                return deeper;
+        }
+        return null;
+    }
+
+    function toggleSidebar() {
+        sidebarOpen = !sidebarOpen;
+        if (sidebarOpen) {
+            revealCurrentInTree();
+            rebuildTree();
+            Qt.callLater(function() { sidebarList.forceActiveFocus(); });
+        } else {
+            editor.forceActiveFocus();
+        }
+    }
+
+    function activateTreeRow(index) {
+        if (index < 0 || index >= treeRows.length)
+            return;
+        var row = treeRows[index];
+        // A folder folds; a note with children folds in Links mode.
+        var foldable = backend.treeMode === "folders" ? row.isDir : row.hasChildren;
+        if (foldable) {
+            var expanded = backend.treeMode === "folders"
+                ? Object.assign({}, expandedFolders) : Object.assign({}, linksExpanded);
+            expanded[row.path] = !expanded[row.path];
+            if (backend.treeMode === "folders")
+                expandedFolders = expanded;
+            else
+                linksExpanded = expanded;
+            rebuildTree();
+            sidebarList.currentIndex = index;
+        } else {
+            openInTab(row.url);
+        }
+    }
+
+    function setTreeFolderOpen(index, open) {
+        if (index < 0 || index >= treeRows.length)
+            return;
+        var row = treeRows[index];
+        var foldable = backend.treeMode === "folders" ? row.isDir : row.hasChildren;
+        if (!foldable || row.expanded === open)
+            return;
+        activateTreeRow(index);
+    }
+
+    // Linked mentions: the notes that link to the open one, as a panel
+    // beside the page. Read from disk each time it opens or the note changes.
+    property bool backlinksOpen: false
+    property var backlinkItems: []
+    property var backlinkCollapsed: ({})
+
+    function refreshBacklinks() {
+        backlinkItems = backlinksOpen ? backend.backlinks() : [];
+    }
+
+    function toggleBacklinks() {
+        backlinksOpen = !backlinksOpen;
+        if (backlinksOpen) {
+            backlinkCollapsed = ({});
+            backend.refreshNoteIndex();
+        }
+        refreshBacklinks();
+        if (!backlinksOpen)
+            editor.forceActiveFocus();
+    }
+
+    function toggleBacklinkSource(path) {
+        var collapsed = Object.assign({}, backlinkCollapsed);
+        collapsed[path] = !collapsed[path];
+        backlinkCollapsed = collapsed;
+    }
+
+    // Tabs: each remembers a file and where the caret was. One document is
+    // open at a time, so switching a tab opens its file again (auto-save
+    // keeps its edits, an unsaved one asks first) and puts the caret back.
+    property var tabs: []
+    property int activeTab: -1
+    // A file about to open in a tab of its own rather than in the current one.
+    property string newTabUrl: ""
+    // A tab to drop once the file next to it has actually opened.
+    property string closingTabUrl: ""
+
+    function tabIndexOf(url) {
+        for (var i = 0; i < tabs.length; ++i) {
+            if (tabs[i].url === url)
+                return i;
+        }
+        return -1;
+    }
+
+    function tabTitle(url) {
+        var name = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
+        return name.replace(/\.(md|markdown)$/i, "");
+    }
+
+    // Opens a note in its own tab, or switches to the tab it is already in.
+    function openInTab(url) {
+        var wanted = url.toString();
+        if (wanted === backend.fileUrl.toString())
+            return;
+        if (tabIndexOf(wanted) < 0)
+            newTabUrl = wanted;
+        requestOpen(url);
+    }
+
+    function switchTab(index) {
+        if (index < 0 || index >= tabs.length || index === activeTab)
+            return;
+        requestOpen(tabs[index].url);
+    }
+
+    function stepTab(direction) {
+        if (tabs.length > 1)
+            switchTab((activeTab + direction + tabs.length) % tabs.length);
+    }
+
+    function closeTab(index) {
+        if (tabs.length <= 1 || index < 0 || index >= tabs.length)
+            return;
+        if (index === activeTab) {
+            // The file stays until the neighbour has opened: an unsaved
+            // prompt the writer cancels must not leave a tab-less document.
+            closingTabUrl = tabs[index].url;
+            requestOpen(tabs[index > 0 ? index - 1 : 1].url);
+            return;
+        }
+        var remaining = tabs.slice();
+        remaining.splice(index, 1);
+        if (index < activeTab)
+            --activeTab;
+        tabs = remaining;
+    }
+
+    // Keeps the tab list in step with whatever file the backend now holds.
+    function syncTabs() {
+        var current = backend.fileUrl.toString();
+        if (current === "")
+            return;
+
+        var list = tabs.slice();
+        // The signal fires before the new text loads, so the caret is still
+        // the one of the tab being left.
+        if (activeTab >= 0 && activeTab < list.length)
+            list[activeTab] = { url: list[activeTab].url, caret: editor.cursorPosition };
+        var activeUrl = activeTab >= 0 && activeTab < list.length ? list[activeTab].url : "";
+        if (closingTabUrl !== "" && closingTabUrl !== current) {
+            list = list.filter(function(tab) { return tab.url !== closingTabUrl; });
+        }
+        closingTabUrl = "";
+
+        var index = -1;
+        for (var i = 0; i < list.length; ++i) {
+            if (list[i].url === current)
+                index = i;
+        }
+        if (index < 0) {
+            var from = -1;
+            for (var j = 0; j < list.length; ++j) {
+                if (list[j].url === activeUrl)
+                    from = j;
+            }
+            if (from >= 0 && current !== newTabUrl) {
+                list[from] = { url: current, caret: 0 };
+                index = from;
+            } else {
+                list.push({ url: current, caret: 0 });
+                index = list.length - 1;
+            }
+        }
+        if (current === newTabUrl)
+            newTabUrl = "";
+
+        tabs = list;
+        activeTab = index;
+        // A tab never left has no caret to give back; touching it would only
+        // move the writer's caret after the fact.
+        var caret = list[index].caret;
+        if (caret > 0) {
+            Qt.callLater(function() {
+                editor.cursorPosition = Math.min(caret, editor.length);
+                editorFlick.ensureCursorVisible();
+            });
+        }
+    }
+
+    function openQuickOpen() {
+        backend.refreshNoteIndex();
+        quickOpen.open();
+    }
+
+    function updateQuickOpen() {
+        quickOpenList.model = backend.noteSuggestions(quickOpenField.text);
+        quickOpenList.currentIndex = quickOpenList.count > 0 ? 0 : -1;
+    }
+
+    function openQuickOpenSelection() {
+        if (quickOpenList.currentIndex < 0
+                || quickOpenList.currentIndex >= quickOpenList.model.length)
+            return;
+        var note = quickOpenList.model[quickOpenList.currentIndex];
+        quickOpen.close();
+        openInTab(note.url);
+    }
+
     FontMetrics {
         id: writerFontMetrics
         font.family: backend.editorFont
@@ -94,6 +550,19 @@ ApplicationWindow {
         win.visibility = win.visibility === Window.FullScreen
             ? Window.Windowed
             : Window.FullScreen;
+    }
+
+    // One binding's worth of the active key for an action, and the list of
+    // them. Both read backend.shortcutMap, so editing a key in the settings
+    // dialog rebinds every Shortcut below without touching this file.
+    function seq(id) {
+        var list = backend.shortcutMap[id];
+        return list && list.length > 0 ? list[0] : "";
+    }
+
+    function seqs(id) {
+        var list = backend.shortcutMap[id];
+        return list ? list : [];
     }
 
     // Only the search field and the next and previous controls select a
@@ -185,110 +654,207 @@ ApplicationWindow {
     }
 
     Shortcut {
-        sequence: "Ctrl+S"
+        sequence: win.seq("save")
         onActivated: backend.save()
     }
 
     Shortcut {
-        sequence: "Ctrl+H"
+        sequence: win.seq("find-replace")
         onActivated: win.openSearch(true)
     }
 
     Shortcut {
-        sequence: "Ctrl+B"
+        sequence: win.seq("bold")
         context: Qt.WindowShortcut
         onActivated: editor.wrapSelection("**")
     }
 
     Shortcut {
-        sequence: "Ctrl+I"
+        sequence: win.seq("italic")
         context: Qt.WindowShortcut
         onActivated: editor.wrapSelection("*")
     }
 
     Shortcut {
-        sequence: "Ctrl+Shift+X"
+        sequence: win.seq("strikethrough")
         context: Qt.WindowShortcut
         onActivated: editor.wrapSelection("~~")
     }
 
     Shortcut {
-        sequence: "Ctrl+K"
+        sequence: win.seq("insert-link")
         context: Qt.WindowShortcut
         onActivated: editor.insertLink()
     }
 
     Shortcut {
-        sequences: ["Ctrl+?", "Ctrl+/", "F1"]
+        sequences: win.seqs("follow-link")
+        context: Qt.WindowShortcut
+        onActivated: win.followLinkAt(editor.cursorPosition)
+    }
+
+    Shortcut {
+        sequences: win.seqs("toggle-task")
+        context: Qt.WindowShortcut
+        onActivated: editor.toggleTaskAtCursor()
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-1")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(0)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-2")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(1)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-3")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(2)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-4")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(3)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-5")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(4)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-6")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(5)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-7")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(6)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-8")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(7)
+    }
+
+    Shortcut {
+        sequence: win.seq("tab-9")
+        context: Qt.WindowShortcut
+        onActivated: win.switchTab(win.tabs.length - 1)
+    }
+
+    Shortcut {
+        sequence: win.seq("next-tab")
+        context: Qt.WindowShortcut
+        onActivated: win.stepTab(1)
+    }
+
+    Shortcut {
+        sequence: win.seq("prev-tab")
+        context: Qt.WindowShortcut
+        onActivated: win.stepTab(-1)
+    }
+
+    Shortcut {
+        sequence: win.seq("close-tab")
+        context: Qt.WindowShortcut
+        onActivated: win.closeTab(win.activeTab)
+    }
+
+    Shortcut {
+        sequence: win.seq("backlinks")
+        context: Qt.WindowShortcut
+        onActivated: win.toggleBacklinks()
+    }
+
+    Shortcut {
+        sequence: win.seq("quick-open")
+        context: Qt.WindowShortcut
+        onActivated: win.openQuickOpen()
+    }
+
+    Shortcut {
+        sequences: win.seqs("shortcuts-dialog")
         onActivated: shortcutsDialog.open()
     }
 
     Shortcut {
         // Ctrl++ is a different shortcut to Qt, not a shifted Ctrl+=, and it is
         // the only one a layout that puts + on its own key can reach.
-        sequences: ["Ctrl+=", "Ctrl++"]
+        sequences: win.seqs("zoom-in")
         onActivated: backend.increaseTextSize()
     }
 
     Shortcut {
-        sequence: "Ctrl+-"
+        sequence: win.seq("zoom-out")
         onActivated: backend.decreaseTextSize()
     }
 
     Shortcut {
-        sequence: "Ctrl+0"
+        sequence: win.seq("zoom-reset")
         onActivated: backend.resetTextSize()
     }
 
     Shortcut {
-        sequence: "Ctrl+O"
-        onActivated: backend.openDialog()
+        objectName: "toggleSidebarShortcut"
+        sequence: win.seq("toggle-sidebar")
+        onActivated: win.toggleSidebar()
     }
 
     Shortcut {
-        sequence: "Ctrl+N"
+        sequence: win.seq("new-window")
         onActivated: backend.newWindow()
     }
 
     Shortcut {
-        sequence: "Ctrl+Shift+S"
+        sequence: win.seq("save-as")
         onActivated: backend.saveAsDialog()
     }
 
     Shortcut {
-        sequence: "Ctrl+P"
+        sequence: win.seq("print")
         onActivated: backend.printDocument()
     }
 
     Shortcut {
-        sequence: "Ctrl+Shift+C"
+        sequence: win.seq("copy-html")
         onActivated: backend.copyAsHtml()
     }
 
     Shortcut {
-        sequences: ["Meta+F", "F11"]
+        sequences: win.seqs("fullscreen")
         onActivated: toggleFullScreen()
     }
 
     Shortcut {
-        sequence: "Ctrl+Z"
+        sequence: win.seq("undo")
         context: Qt.WindowShortcut
         onActivated: editor.undo()
     }
 
     Shortcut {
-        sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]
+        sequences: win.seqs("redo")
         context: Qt.WindowShortcut
         onActivated: editor.redo()
     }
 
     Shortcut {
-        sequence: "Ctrl+F"
+        sequence: win.seq("find")
         onActivated: win.openSearch(false)
     }
 
     Shortcut {
-        sequence: "Ctrl+G"
+        sequence: win.seq("find-next")
         enabled: win.searchOpen
         onActivated: win.moveSearch(1)
     }
@@ -296,7 +862,23 @@ ApplicationWindow {
     Connections {
         target: backend
 
+        function onFileUrlChanged() {
+            // The folder a note lives in decides which image embeds resolve,
+            // so look at the pictures again when it knows where it lives.
+            editor.refreshImages();
+            win.refreshBacklinks();
+            win.syncTabs();
+            if (win.sidebarOpen) {
+                win.revealCurrentInTree();
+                win.rebuildTree();
+            }
+        }
+
         function onOpenDialogRequested() {
+            // Start where the document being written lives, not in whatever
+            // folder the dialog last remembered or the recent-files view.
+            if (backend.documentFolder.toString().length > 0)
+                openFileDialog.currentFolder = backend.documentFolder;
             openFileDialog.open();
         }
 
@@ -391,6 +973,16 @@ ApplicationWindow {
         onReloadRequested: backend.reloadFromDisk()
     }
 
+    SettingsDialog {
+        id: settingsDialog
+        darkMode: win.darkMode
+        textScale: win.textScale
+        textColor: win.textColor
+        activeButtonColor: backend.themeAccent
+        containerWidth: win.width
+        containerHeight: win.height
+    }
+
     ShortcutsDialog {
         id: shortcutsDialog
         darkMode: win.darkMode
@@ -401,15 +993,170 @@ ApplicationWindow {
         containerHeight: win.height
     }
 
+    // Ctrl+Shift+O: search every note in the slipbox by name, without leaving
+    // the document. The ordinary Open dialog is for reaching files outside it.
+    // A plain overlay rather than a Popup, so the text field owns the keyboard
+    // from the first keypress.
     Item {
+        id: quickOpen
+        objectName: "quickOpen"
+        anchors.fill: parent
+        visible: false
+        z: 100
+
+        function open() {
+            visible = true;
+            quickOpenField.text = "";
+            win.updateQuickOpen();
+            Qt.callLater(function() {
+                quickOpenField.forceActiveFocus();
+                quickOpenField.cursorPosition = quickOpenField.text.length;
+            });
+        }
+
+        function close() {
+            if (!visible)
+                return;
+            visible = false;
+            editor.forceActiveFocus();
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            color: Qt.rgba(0, 0, 0, 0.5)
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: quickOpen.close()
+            }
+        }
+
+        Rectangle {
+            id: quickOpenPanel
+            x: Math.round((win.width - width) / 2)
+            y: Math.round(win.height * 0.12)
+            width: Math.min(win.scaledSize(620), win.width - 48)
+            height: Math.min(win.scaledSize(420), win.height - 160)
+            color: win.darkMode ? "#22221f" : "#fffef2"
+            border.color: win.darkMode ? "#4f525a" : "#d9d8c8"
+            border.width: 1
+            radius: 9
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
+
+                TextField {
+                    id: quickOpenField
+                    objectName: "quickOpenField"
+                    Layout.fillWidth: true
+                    placeholderText: text.length === 0 ? "Open other file…" : ""
+                    placeholderTextColor: win.mutedColor
+                    color: win.textColor
+                    selectionColor: win.selectionFill
+                    selectedTextColor: win.selectionTextColor
+                    font.family: backend.editorFont
+                    font.pixelSize: win.scaledSize(17)
+                    leftPadding: win.scaledSize(16)
+                    rightPadding: win.scaledSize(16)
+                    topPadding: win.scaledSize(14)
+                    bottomPadding: win.scaledSize(14)
+                    background: Rectangle {
+                        color: win.darkMode ? "#22221f" : "#fffef2"
+                    }
+                    onTextChanged: win.updateQuickOpen()
+                    Keys.onDownPressed: quickOpenList.incrementCurrentIndex()
+                    Keys.onUpPressed: quickOpenList.decrementCurrentIndex()
+                    Keys.onReturnPressed: win.openQuickOpenSelection()
+                    Keys.onEscapePressed: quickOpen.close()
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    height: 1
+                    color: win.darkMode ? "#3a3a33" : "#e3e2d2"
+                }
+
+                ListView {
+                    id: quickOpenList
+                    objectName: "quickOpenList"
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.topMargin: 4
+                    Layout.bottomMargin: 4
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    highlightFollowsCurrentItem: true
+
+                    delegate: Rectangle {
+                        id: quickRow
+                        required property var modelData
+                        required property int index
+                        width: ListView.view.width
+                        height: win.scaledSize(40)
+                        radius: 6
+                        color: index === quickOpenList.currentIndex
+                            ? (win.darkMode ? "#35352f" : "#efeedc")
+                            : "transparent"
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 16
+                            anchors.rightMargin: 16
+                            spacing: 12
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: quickRow.modelData.name
+                                color: win.textColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(15)
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                readonly property string folder: {
+                                    var path = quickRow.modelData.path;
+                                    var slash = path.lastIndexOf("/");
+                                    return slash >= 0 ? path.slice(0, slash) : "";
+                                }
+                                visible: folder !== ""
+                                text: folder
+                                color: win.mutedColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(12)
+                                elide: Text.ElideRight
+                                Layout.maximumWidth: quickOpenPanel.width * 0.4
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onEntered: quickOpenList.currentIndex = quickRow.index
+                            onClicked: {
+                                quickOpenList.currentIndex = quickRow.index;
+                                win.openQuickOpenSelection();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Item {
+        id: rootItem
         anchors.fill: parent
 
         Flickable {
             id: editorFlick
             objectName: "editorScroll"
             anchors.fill: parent
-            anchors.leftMargin: 24
-            anchors.rightMargin: 24
+            anchors.leftMargin: 24 + win.sidebarWidth
+            anchors.rightMargin: 24 + win.backlinksWidth
             // Inset the scrolling area by the footer strip at both ends, so
             // scrolled text never runs under the footer buttons, status, or
             // word count, and stops just as far short of the top edge.
@@ -443,7 +1190,7 @@ ApplicationWindow {
             // animation gets shorter as the outstanding distance grows, and a
             // notch landing mid-animation carries the current velocity into
             // the new curve, so sustained spinning keeps picking up speed.
-            readonly property real wheelStep: win.scaledSize(120)
+            readonly property real wheelStep: win.scaledSize(120) * backend.scrollSpeed
 
             FrameAnimation {
                 id: wheelScroll
@@ -548,7 +1295,10 @@ ApplicationWindow {
             }
 
             onMovementStarted: wheelScroll.stop()
-            onContentYChanged: editor.hoveredLinkUrl = ""
+            onContentYChanged: {
+                editor.hoveredLinkUrl = "";
+                win.positionWikiPopup();
+            }
 
             // Ctrl+wheel changes the text size, as it does in a browser. A
             // wheel notch is a whole step, but a touchpad trickles in pixels,
@@ -662,8 +1412,16 @@ ApplicationWindow {
                     color: win.textColor
                 }
                 onCursorRectangleChanged: editorFlick.ensureCursorVisible()
-                onCursorPositionChanged: backend.setCaretPosition(cursorPosition)
+                onCursorPositionChanged: {
+                    backend.setCaretPosition(cursorPosition);
+                    // The highlighter has just shown or hidden markers on the
+                    // line, so let the checkbox overlays measure themselves
+                    // again after that relayout.
+                    caretRevision++;
+                    win.refreshWikiPopup();
+                }
                 onFontChanged: backend.documentFontChanged()
+                onActiveFocusChanged: if (!activeFocus) win.closeWikiPopup()
 
                 // One edit command, so a single undo takes the change back.
                 function replaceText(start, end, replacement) {
@@ -672,6 +1430,42 @@ ApplicationWindow {
 
                 function replaceSelectionWith(replacement) {
                     EditorMutations.replaceRange(editor, selectionStart, selectionEnd, replacement);
+                }
+
+                function refreshTaskMarkers() {
+                    taskMarkers = backend.taskMarkers();
+                }
+
+                // Rows are updated in place rather than replaced, so typing
+                // near an image moves it without loading it again.
+                function refreshImages() {
+                    var images = backend.imageEmbeds();
+                    for (var i = 0; i < images.length; ++i) {
+                        if (i < imageModel.count)
+                            imageModel.set(i, images[i]);
+                        else
+                            imageModel.append(images[i]);
+                    }
+                    if (imageModel.count > images.length)
+                        imageModel.remove(images.length, imageModel.count - images.length);
+                }
+
+                // The widest an image is drawn: the writing column at full
+                // width. A narrower window scales images down to fit.
+                readonly property int imageAreaWidth:
+                    Math.round(writerFontMetrics.averageCharacterWidth * 65)
+                onImageAreaWidthChanged: {
+                    backend.setImageAreaWidth(imageAreaWidth);
+                    refreshImages();
+                }
+
+                ListModel {
+                    id: imageModel
+                }
+
+                function toggleTaskAtCursor() {
+                    if (backend.toggleTaskAt(cursorPosition))
+                        forceActiveFocus();
                 }
 
                 function wrapSelection(marker) {
@@ -714,13 +1508,26 @@ ApplicationWindow {
                     }
                     var match = line.match(/^(\s*)([-+*]|\d+[.)]|>+)\s+(.*)$/);
                     if (match) {
+                        var marker = match[2];
+                        if (/^\d/.test(marker))
+                            marker = (parseInt(marker) + 1) + marker.slice(-1);
+                        // A task carries an unchecked checkbox to the next
+                        // line, and one left empty ends the list like an empty
+                        // item does.
+                        var task = match[3].match(/^\[[ xX]\](?:[ \t]+(.*)|$)/);
+                        if (task) {
+                            if (!task[1] || /^\s*$/.test(task[1])) {
+                                EditorMutations.replaceRange(editor, lineStart,
+                                                             cursorPosition, "\n");
+                            } else {
+                                replaceSelectionWith("\n" + match[1] + marker + " [ ] ");
+                            }
+                            return;
+                        }
                         if (match[3].length === 0) {
                             EditorMutations.replaceRange(editor, lineStart,
                                                          cursorPosition, "\n");
                         } else {
-                            var marker = match[2];
-                            if (/^\d/.test(marker))
-                                marker = (parseInt(marker) + 1) + marker.slice(-1);
                             replaceSelectionWith("\n" + match[1] + marker + " ");
                         }
                         return;
@@ -843,6 +1650,24 @@ ApplicationWindow {
                     return true;
                 }
 
+                // An image on the clipboard is saved beside the notes and
+                // embedded on a line of its own, where it is drawn.
+                function pasteClipboardImage() {
+                    var result = backend.pasteClipboardImage();
+                    if (!result.handled)
+                        return false;
+                    if (result.text.length === 0)
+                        return true;
+
+                    var start = selectionStart;
+                    var end = selectionEnd;
+                    var before = start > 0 ? text.charAt(start - 1) : "\n";
+                    var after = end < length ? text.charAt(end) : "\n";
+                    replaceSelectionWith((before === "\n" ? "" : "\n") + result.text
+                                         + (after === "\n" ? "" : "\n"));
+                    return true;
+                }
+
                 function pasteClipboardAsPlainText() {
                     var pastedText = backend.clipboardText();
                     if (pastedText.length > 0)
@@ -921,6 +1746,30 @@ ApplicationWindow {
 
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event) {
+                    if (wikiPopup.visible) {
+                        if (event.key === Qt.Key_Down) {
+                            wikiPopup.moveSelection(1);
+                            event.accepted = true;
+                            return;
+                        }
+                        if (event.key === Qt.Key_Up) {
+                            wikiPopup.moveSelection(-1);
+                            event.accepted = true;
+                            return;
+                        }
+                        if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                                || event.key === Qt.Key_Tab) {
+                            win.acceptWikiSuggestion(wikiPopup.currentIndex);
+                            event.accepted = true;
+                            return;
+                        }
+                        if (event.key === Qt.Key_Escape) {
+                            win.closeWikiPopup();
+                            event.accepted = true;
+                            return;
+                        }
+                    }
+
                     var pasteKey = (event.key === Qt.Key_V)
                         && (event.modifiers & Qt.ControlModifier)
                         && !(event.modifiers & (Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier));
@@ -928,7 +1777,7 @@ ApplicationWindow {
                         && (event.modifiers & Qt.ShiftModifier)
                         && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier));
                     if (pasteKey || shiftInsert) {
-                        if (!pasteClipboardUrlAsMarkdownLink())
+                        if (!pasteClipboardImage() && !pasteClipboardUrlAsMarkdownLink())
                             pasteClipboardAsPlainText();
                         event.accepted = true;
                         return;
@@ -971,11 +1820,17 @@ ApplicationWindow {
 
                 onTextChanged: {
                     hoveredLinkUrl = "";
+                    refreshTaskMarkers();
+                    refreshImages();
+                    // The document re-lays out after this signal; remeasure
+                    // the checkboxes once it has.
+                    Qt.callLater(function() { caretRevision++; });
                     if (win.searchUpdating)
                         return;
                     var contentChanged = backend.editorTextChanged();
                     if (win.searchOpen && contentChanged)
                         win.updateSearch(false);
+                    win.refreshWikiPopup();
                 }
 
                 Text {
@@ -992,6 +1847,10 @@ ApplicationWindow {
                 property string hoveredLinkUrl: ""
                 property real linkHoverX: 0
                 property real linkHoverY: 0
+                // Task markers in document order, and a counter that changes
+                // after the caret restyles a line so their overlays remeasure.
+                property var taskMarkers: []
+                property int caretRevision: 0
 
                 // positionAt() snaps to the nearest caret, even past the end of a
                 // line, so only count a character the pointer is inside: the one
@@ -1013,17 +1872,40 @@ ApplicationWindow {
                     return "";
                 }
 
+                // TextEdit takes the pointer for selection, so a plain
+                // TapHandler never sees Ctrl+click. This MouseArea consumes
+                // only the press that lands on a wikilink and lets every other
+                // press through for the caret.
                 MouseArea {
                     anchors.fill: parent
-                    acceptedButtons: Qt.NoButton
+                    acceptedButtons: Qt.LeftButton
                     hoverEnabled: true
+                    propagateComposedEvents: true
+                    preventStealing: true
                     cursorShape: Qt.IBeamCursor
                     onPositionChanged: (mouse) => {
                         editor.linkHoverX = mouse.x;
                         editor.linkHoverY = mouse.y;
                         editor.hoveredLinkUrl = editor.linkUrlUnder(mouse.x, mouse.y);
+                        var position = editor.positionAt(mouse.x, mouse.y);
+                        cursorShape = (mouse.modifiers & Qt.ControlModifier)
+                            && (backend.wikiLinkAt(position).kind !== "none"
+                                || backend.linkUrlAt(position).length > 0
+                                || backend.imageUrlAt(position).toString().length > 0)
+                            ? Qt.PointingHandCursor : Qt.IBeamCursor;
                     }
-                    onExited: editor.hoveredLinkUrl = ""
+                    onExited: {
+                        editor.hoveredLinkUrl = "";
+                        cursorShape = Qt.IBeamCursor;
+                    }
+                    onPressed: (mouse) => {
+                        if ((mouse.modifiers & Qt.ControlModifier)
+                                && win.followLinkAt(editor.positionAt(mouse.x, mouse.y))) {
+                            mouse.accepted = true;
+                            return;
+                        }
+                        mouse.accepted = false;
+                    }
                 }
 
                 ToolTip {
@@ -1043,9 +1925,238 @@ ApplicationWindow {
                     width: Math.min(implicitWidth, win.width - 32)
                 }
 
+                // A task item's "[ ]" is hidden by the highlighter and a
+                // checkbox is drawn over the width it reserved. The raw
+                // marker shows instead while the caret is inside it, so it
+                // can still be edited like any other Markdown marker.
+                Repeater {
+                    model: editor.taskMarkers
+
+                    delegate: Item {
+                        id: taskCheckbox
+                        objectName: "taskCheckbox"
+                        required property var modelData
+
+                        readonly property rect markerRect: {
+                            // The highlighter restyles the line before this
+                            // counter changes, so the marker has its final
+                            // width when it is measured here. contentHeight
+                            // catches the layout settling after an edit.
+                            var revision = editor.caretRevision;
+                            var contentHeight = editor.contentHeight;
+                            var contentWidth = editor.contentWidth;
+                            var fontFamily = editor.font.family;
+                            var left = editor.positionToRectangle(modelData.position);
+                            var right = editor.positionToRectangle(modelData.position + 3);
+                            var width = editor.width;
+                            var pixelSize = editor.font.pixelSize;
+                            if (right.x <= left.x || right.y !== left.y) {
+                                return Qt.rect(left.x, left.y,
+                                               Math.max(10, Math.round(pixelSize * 0.72)),
+                                               left.height);
+                            }
+                            return Qt.rect(left.x, left.y, right.x - left.x, left.height);
+                        }
+                        readonly property int boxSize: Math.max(8, Math.round(Math.min(
+                            markerRect.width, markerRect.height * 0.62)))
+                        x: Math.round(markerRect.x + (markerRect.width - width) / 2)
+                        y: Math.round(markerRect.y + (markerRect.height - height) / 2)
+                        width: boxSize + 8
+                        height: boxSize + 8
+                        visible: editor.cursorPosition < modelData.position
+                                 || editor.cursorPosition >= modelData.position + 3
+                        z: 1
+
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: taskCheckbox.boxSize
+                            height: taskCheckbox.boxSize
+                            radius: Math.max(1, Math.round(taskCheckbox.boxSize * 0.15))
+                            color: taskCheckbox.modelData.checked ? backend.themeAccent
+                                                                  : "transparent"
+                            border.width: Math.max(1, Math.round(win.textScale))
+                            border.color: taskCheckbox.modelData.checked ? backend.themeAccent
+                                                                         : win.mutedColor
+
+                            Canvas {
+                                anchors.fill: parent
+                                visible: taskCheckbox.modelData.checked
+                                onVisibleChanged: if (visible) requestPaint()
+                                onPaint: {
+                                    var context = getContext("2d");
+                                    context.clearRect(0, 0, width, height);
+                                    context.strokeStyle = win.pageColor;
+                                    context.lineWidth = Math.max(1.5, width * 0.15);
+                                    context.lineCap = "round";
+                                    context.lineJoin = "round";
+                                    context.beginPath();
+                                    context.moveTo(width * 0.26, height * 0.52);
+                                    context.lineTo(width * 0.43, height * 0.72);
+                                    context.lineTo(width * 0.76, height * 0.30);
+                                    context.stroke();
+                                }
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                editor.forceActiveFocus();
+                                backend.toggleTaskAt(taskCheckbox.modelData.position);
+                            }
+                        }
+                    }
+                }
+
+                // An image line's text is hidden while the caret is away, and
+                // the image is drawn in the room Backend reserved below it.
+                Repeater {
+                    objectName: "imagePreviews"
+                    model: imageModel
+
+                    delegate: Image {
+                        id: imagePreview
+                        objectName: "imagePreview"
+                        required property int blockStart
+                        required property int blockEnd
+                        required property url imageUrl
+                        required property int imageWidth
+                        required property int imageHeight
+                        required property int imagePad
+
+                        readonly property rect lineRect: {
+                            var revision = editor.caretRevision;
+                            var contentHeight = editor.contentHeight;
+                            var editorWidth = editor.width;
+                            return editor.positionToRectangle(blockEnd);
+                        }
+                        x: 0
+                        y: Math.round(lineRect.y + lineRect.height + imagePad)
+                        width: Math.min(imageWidth, editor.width)
+                        height: Math.round(width * imageHeight / Math.max(1, imageWidth))
+                        source: imageUrl
+                        sourceSize.width: Math.round(imageWidth * Screen.devicePixelRatio)
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                        smooth: true
+                        mipmap: true
+
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            // A click opens the picture full-window; Ctrl+click
+                            // still hands it to the system viewer. Closing the
+                            // viewer leaves the caret on the embed for editing.
+                            onClicked: (mouse) => {
+                                if (mouse.modifiers & Qt.ControlModifier) {
+                                    backend.openImage(imagePreview.imageUrl);
+                                    return;
+                                }
+                                win.openImageViewer(imagePreview.blockStart);
+                            }
+                        }
+                    }
+                }
+
                 Component.onCompleted: {
+                    backend.setImageAreaWidth(imageAreaWidth);
                     backend.attachDocument(textDocument);
+                    refreshTaskMarkers();
+                    refreshImages();
                     forceActiveFocus();
+                }
+            }
+        }
+
+        // [[note]] suggestions, kept outside the Flickable so its clipping
+        // cannot cut the list off, and keyboard-driven so the caret never
+        // leaves the document.
+        Rectangle {
+            id: wikiPopup
+            objectName: "wikiPopup"
+            visible: false
+            z: 60
+            width: win.scaledSize(420)
+            height: Math.min(win.scaledSize(300),
+                             Math.max(1, suggestions.length) * rowHeight + 8)
+            color: win.darkMode ? "#22221f" : "#fffef2"
+            border.color: win.darkMode ? "#4f525a" : "#d9d8c8"
+            border.width: 1
+            radius: 9
+            clip: true
+
+            property var suggestions: []
+            property int currentIndex: 0
+            property int replaceStart: -1
+            property string query: ""
+            readonly property int rowHeight: win.scaledSize(34)
+
+            function moveSelection(delta) {
+                if (suggestions.length === 0)
+                    return;
+                currentIndex = (currentIndex + delta + suggestions.length)
+                               % suggestions.length;
+                list.positionViewAtIndex(currentIndex, ListView.Contain);
+            }
+
+            ListView {
+                id: list
+                anchors.fill: parent
+                anchors.margins: 4
+                clip: true
+                model: wikiPopup.suggestions
+                boundsBehavior: Flickable.StopAtBounds
+                delegate: Rectangle {
+                    id: row
+                    required property var modelData
+                    required property int index
+                    width: ListView.view.width
+                    height: wikiPopup.rowHeight
+                    radius: 6
+                    color: index === wikiPopup.currentIndex
+                        ? (win.darkMode ? "#35352f" : "#efeedc")
+                        : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 8
+                        spacing: 8
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: row.modelData.name
+                            color: win.textColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(15)
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            readonly property string folder: {
+                                var path = row.modelData.path;
+                                var slash = path.lastIndexOf("/");
+                                return slash >= 0 ? path.slice(0, slash) : "";
+                            }
+                            visible: folder !== ""
+                            text: folder
+                            color: win.mutedColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(12)
+                            elide: Text.ElideRight
+                            Layout.maximumWidth: wikiPopup.width * 0.4
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onEntered: wikiPopup.currentIndex = row.index
+                        onClicked: win.acceptWikiSuggestion(row.index)
+                    }
                 }
             }
         }
@@ -1076,12 +2187,28 @@ ApplicationWindow {
             }
 
             FooterIconButton {
+                objectName: "quickOpenButton"
+                iconName: "search"
+                iconColor: win.mutedColor
+                tooltip: "Open other file (Ctrl+Shift+O)"
+                onClicked: win.openQuickOpen()
+            }
+
+            FooterIconButton {
                 id: fontButton
                 objectName: "fontButton"
                 iconName: "font"
                 iconColor: win.mutedColor
                 tooltip: "Font"
                 onClicked: fontPicker.opened ? fontPicker.close() : fontPicker.open()
+            }
+
+            FooterIconButton {
+                objectName: "settingsButton"
+                iconName: "settings"
+                iconColor: win.mutedColor
+                tooltip: "Settings"
+                onClicked: settingsDialog.open()
             }
 
             Label {
@@ -1307,7 +2434,466 @@ ApplicationWindow {
         }
     }
 
+    // The file viewer. A plain overlay on the left; the page makes room for it.
+    // It wears the page color, so the tree reads as part of the sheet rather
+    // than a separate panel.
+    Rectangle {
+        id: sidebar
+        objectName: "fileViewer"
+        visible: win.sidebarOpen
+        z: 50
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.topMargin: win.footerHeight
+        anchors.bottomMargin: win.footerHeight
+        width: win.sidebarWidth
+        color: win.pageColor
+        border.color: win.darkMode ? "#4f525a" : "#d9d8c8"
+        border.width: 1
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 0
+
+            // Vault name, the Links/Folders source switch, and the collapse
+            // button that hides the tree back to a distraction-free page.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: win.scaledSize(14)
+                Layout.rightMargin: win.scaledSize(10)
+                Layout.topMargin: win.scaledSize(12)
+                Layout.bottomMargin: win.scaledSize(8)
+                spacing: win.scaledSize(10)
+
+                Text {
+                    objectName: "fileViewerRoot"
+                    Layout.fillWidth: true
+                    text: {
+                        var root = win.sidebarOpen ? backend.fileTreeRoot() : "";
+                        return root.slice(root.lastIndexOf("/") + 1) || root;
+                    }
+                    color: win.textColor
+                    font.family: backend.editorFont
+                    font.pixelSize: win.scaledSize(16)
+                    elide: Text.ElideRight
+                }
+
+                TreeHeaderButton {
+                    objectName: "treeModeLinks"
+                    label: "Links"
+                    active: backend.treeMode === "links"
+                    activeColor: win.textColor
+                    inactiveColor: win.mutedColor
+                    fontFamily: backend.editorFont
+                    pixelSize: win.scaledSize(13)
+                    onClicked: { backend.treeMode = "links"; win.rebuildTree(); }
+                }
+
+                TreeHeaderButton {
+                    objectName: "treeModeFolders"
+                    label: "Folders"
+                    active: backend.treeMode === "folders"
+                    activeColor: win.textColor
+                    inactiveColor: win.mutedColor
+                    fontFamily: backend.editorFont
+                    pixelSize: win.scaledSize(13)
+                    onClicked: { backend.treeMode = "folders"; win.rebuildTree(); }
+                }
+
+                TreeHeaderButton {
+                    objectName: "treeCollapse"
+                    label: "«"
+                    active: false
+                    activeColor: win.mutedColor
+                    inactiveColor: win.mutedColor
+                    fontFamily: backend.editorFont
+                    pixelSize: win.scaledSize(18)
+                    onClicked: win.toggleSidebar()
+                }
+            }
+
+            ListView {
+                id: sidebarList
+                objectName: "fileViewerList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: win.treeRows
+                currentIndex: -1
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                Keys.onReturnPressed: win.activateTreeRow(currentIndex)
+                Keys.onEnterPressed: win.activateTreeRow(currentIndex)
+                Keys.onRightPressed: win.setTreeFolderOpen(currentIndex, true)
+                Keys.onLeftPressed: win.setTreeFolderOpen(currentIndex, false)
+                Keys.onEscapePressed: win.toggleSidebar()
+
+                // The default wheel step crawls next to the editor's eased
+                // scrolling, so the tree scrolls at the same speed setting.
+                WheelHandler {
+                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                    onWheel: function(wheel) {
+                        var step = win.scaledSize(120) * backend.scrollSpeed;
+                        var y = wheel.pixelDelta.y !== 0
+                            ? sidebarList.contentY - wheel.pixelDelta.y * backend.scrollSpeed
+                            : sidebarList.contentY - wheel.angleDelta.y / 120 * step;
+                        var maxY = Math.max(0, sidebarList.contentHeight - sidebarList.height);
+                        sidebarList.contentY = Math.max(0, Math.min(maxY, y));
+                        wheel.accepted = true;
+                    }
+                }
+
+                delegate: Rectangle {
+                    id: treeRow
+                    required property var modelData
+                    required property int index
+                    readonly property bool current: !modelData.isDir
+                        && modelData.path === backend.fileTreeCurrentPath()
+                    width: ListView.view.width
+                    height: win.scaledSize(30)
+                    color: ListView.isCurrentItem && sidebarList.activeFocus
+                        ? (win.darkMode ? "#44443b" : "#e2e0c4")
+                        : (current || treeMouse.containsMouse
+                           ? (win.darkMode ? "#35352f" : "#efeedc") : "transparent")
+
+                    Row {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: win.scaledSize(10) + modelData.depth * win.scaledSize(16)
+                        anchors.right: parent.right
+                        anchors.rightMargin: win.scaledSize(8)
+                        spacing: win.scaledSize(6)
+
+                        Text {
+                            width: win.scaledSize(14)
+                            text: (treeRow.modelData.isDir || treeRow.modelData.hasChildren)
+                                ? (treeRow.modelData.expanded ? "⌄" : "›") : ""
+                            color: win.mutedColor
+                            font.pixelSize: win.scaledSize(15)
+                        }
+
+                        Text {
+                            width: parent.width - win.scaledSize(20)
+                                - (treeRow.modelData.childCount > 0 ? win.scaledSize(30) : 0)
+                            text: treeRow.modelData.name
+                            color: (treeRow.modelData.isDir || treeRow.modelData.hasChildren
+                                    || treeRow.current)
+                                ? win.textColor : win.mutedColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(14)
+                            font.bold: treeRow.current
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            visible: treeRow.modelData.childCount > 0
+                            text: treeRow.modelData.childCount
+                            color: win.mutedColor
+                            font.family: backend.editorFont
+                            font.pixelSize: win.scaledSize(12)
+                        }
+                    }
+
+                    MouseArea {
+                        id: treeMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: {
+                            sidebarList.currentIndex = treeRow.index;
+                            win.activateTreeRow(treeRow.index);
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                height: 1
+                color: win.darkMode ? "#3a3a33" : "#e3e2d2"
+            }
+
+            Text {
+                objectName: "fileViewerBrowse"
+                Layout.fillWidth: true
+                Layout.margins: win.scaledSize(12)
+                text: "Open another location…"
+                color: win.mutedColor
+                font.family: backend.editorFont
+                font.pixelSize: win.scaledSize(13)
+
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: backend.openDialog()
+                }
+            }
+        }
+    }
+
+    // The open notes, along the top where the page leaves a strip free. Only
+    // shown once there is more than one, so a lone note stays distraction-free.
+    Row {
+        id: tabStrip
+        objectName: "tabStrip"
+        visible: win.tabs.length > 1
+        z: 60
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: 24
+        anchors.rightMargin: 24
+        height: win.footerHeight
+        spacing: 2
+
+        Repeater {
+            model: win.tabs
+
+            delegate: Rectangle {
+                id: tabItem
+                required property var modelData
+                required property int index
+                readonly property bool active: index === win.activeTab
+                objectName: "tab" + index
+                width: Math.min(win.scaledSize(190),
+                                Math.max(win.scaledSize(70),
+                                         (tabStrip.width - 2 * win.tabs.length) / win.tabs.length))
+                height: tabStrip.height - 4
+                y: 4
+                radius: 6
+                color: active ? (win.darkMode ? "#35352f" : "#efeedc")
+                              : (tabMouse.containsMouse ? (win.darkMode ? "#2a2a26" : "#f6f5e6")
+                                                        : "transparent")
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.right: closeLabel.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: win.scaledSize(10)
+                    text: win.tabTitle(tabItem.modelData.url)
+                    color: tabItem.active ? win.textColor : win.mutedColor
+                    font.family: backend.editorFont
+                    font.pixelSize: win.scaledSize(13)
+                    elide: Text.ElideRight
+                }
+
+                MouseArea {
+                    id: tabMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+                    onClicked: function(mouse) {
+                        if (mouse.button === Qt.MiddleButton)
+                            win.closeTab(tabItem.index);
+                        else
+                            win.switchTab(tabItem.index);
+                    }
+                }
+
+                Text {
+                    id: closeLabel
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.rightMargin: win.scaledSize(8)
+                    text: "×"
+                    visible: tabItem.active || tabMouse.containsMouse
+                    color: win.mutedColor
+                    font.pixelSize: win.scaledSize(16)
+
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -4
+                        onClicked: win.closeTab(tabItem.index)
+                    }
+                }
+            }
+        }
+    }
+
+    // Obsidian's "Linked mentions": every note that links here, collapsible
+    // to the lines that do. A plain overlay so it never reflows the page.
+    Rectangle {
+        id: backlinksPanel
+        objectName: "backlinksPanel"
+        visible: win.backlinksOpen
+        z: 50
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.topMargin: win.footerHeight
+        anchors.bottomMargin: win.footerHeight
+        width: win.backlinksWidth
+        color: win.darkMode ? "#22221f" : "#fffef2"
+        border.color: win.darkMode ? "#4f525a" : "#d9d8c8"
+        border.width: 1
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 0
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.margins: win.scaledSize(14)
+                spacing: win.scaledSize(8)
+
+                Text {
+                    text: "Linked mentions"
+                    color: win.textColor
+                    font.family: backend.editorFont
+                    font.pixelSize: win.scaledSize(18)
+                }
+
+                Text {
+                    objectName: "backlinksCount"
+                    text: {
+                        var total = 0;
+                        for (var i = 0; i < win.backlinkItems.length; ++i)
+                            total += win.backlinkItems[i].count;
+                        return total;
+                    }
+                    color: win.mutedColor
+                    font.family: backend.editorFont
+                    font.pixelSize: win.scaledSize(14)
+                }
+
+                Item { Layout.fillWidth: true }
+            }
+
+            Text {
+                objectName: "backlinksEmpty"
+                visible: win.backlinkItems.length === 0
+                Layout.fillWidth: true
+                Layout.leftMargin: win.scaledSize(14)
+                Layout.rightMargin: win.scaledSize(14)
+                text: "No other note links here."
+                color: win.mutedColor
+                font.family: backend.editorFont
+                font.pixelSize: win.scaledSize(14)
+                wrapMode: Text.WordWrap
+            }
+
+            ListView {
+                id: backlinksList
+                objectName: "backlinksList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: win.backlinkItems
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                delegate: Column {
+                    id: sourceItem
+                    required property var modelData
+                    readonly property bool collapsed:
+                        win.backlinkCollapsed[modelData.path] === true
+                    width: ListView.view.width
+
+                    Rectangle {
+                        width: parent.width
+                        height: win.scaledSize(38)
+                        color: sourceMouse.containsMouse
+                            ? (win.darkMode ? "#35352f" : "#efeedc") : "transparent"
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: win.scaledSize(14)
+                            anchors.rightMargin: win.scaledSize(14)
+                            spacing: win.scaledSize(8)
+
+                            Text {
+                                text: sourceItem.collapsed ? "›" : "⌄"
+                                color: win.mutedColor
+                                font.pixelSize: win.scaledSize(16)
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: sourceItem.modelData.name
+                                color: win.textColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(15)
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                text: sourceItem.modelData.count
+                                color: win.mutedColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(13)
+                            }
+                        }
+
+                        MouseArea {
+                            id: sourceMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: win.toggleBacklinkSource(sourceItem.modelData.path)
+                        }
+                    }
+
+                    Repeater {
+                        model: sourceItem.collapsed ? [] : sourceItem.modelData.mentions
+
+                        delegate: Rectangle {
+                            id: mentionRow
+                            required property var modelData
+                            width: sourceItem.width
+                            height: mentionText.implicitHeight + win.scaledSize(14)
+                            color: mentionMouse.containsMouse
+                                ? (win.darkMode ? "#35352f" : "#efeedc") : "transparent"
+
+                            Text {
+                                id: mentionText
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.leftMargin: win.scaledSize(36)
+                                anchors.rightMargin: win.scaledSize(14)
+                                text: mentionRow.modelData.text
+                                color: win.mutedColor
+                                font.family: backend.editorFont
+                                font.pixelSize: win.scaledSize(14)
+                                wrapMode: Text.Wrap
+                                maximumLineCount: 3
+                                elide: Text.ElideRight
+                            }
+
+                            MouseArea {
+                                id: mentionMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                onClicked: win.openInTab(sourceItem.modelData.url)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Above the whole page, so a picture can use the window's width rather
+    // than just the writing column's.
+    ImageViewer {
+        id: imageViewer
+        objectName: "imageViewer"
+        anchors.fill: parent
+        images: win.viewerImages
+        index: win.viewerIndex
+        fontFamily: backend.editorFont
+        textScale: win.textScale
+        onStepRequested: function(direction) { win.stepImageViewer(direction) }
+        onCloseRequested: win.closeImageViewer()
+    }
+
     Component.onCompleted: {
+        syncTabs();
+        // Started without a file, there is nothing to look at but a blank
+        // page, so lead with the file viewer.
+        if (backend.fileUrl.toString() === "")
+            toggleSidebar();
         var geometry = backend.windowGeometry();
         if (geometry.x >= 0) x = geometry.x;
         if (geometry.y >= 0) y = geometry.y;

@@ -1,9 +1,15 @@
 #include <QtTest>
+#include <QDir>
+#include <QFile>
 #include <QScopeGuard>
+#include <QTemporaryDir>
 #include <QThreadPool>
 #include <QSignalSpy>
 #include <QSemaphore>
 #include <QFont>
+#include <QImage>
+#include <QImageReader>
+#include <QRegularExpression>
 #include <QAbstractTextDocumentLayout>
 #include <QTextBlock>
 #include <QTextDocument>
@@ -74,6 +80,75 @@ private slots:
         QCOMPARE(Backend::countWords(QStringLiteral("𠀀𠀁 foo")), 3);
         QCOMPARE(Backend::countWords(QStringLiteral("안녕하세요 세계")), 2);
         QCOMPARE(Backend::countWords(QString()), 0);
+        // A task's checkbox is state, not a word, checked or not.
+        QCOMPARE(Backend::countWords(QStringLiteral("- [ ] one\n- [x] two")), 2);
+        QCOMPARE(Backend::countWords(QStringLiteral("- [x] done\nplain [x] text")), 4);
+    }
+
+    void findsTaskMarkers() {
+        const auto marker = [](const QString &text) {
+            return MarkdownHighlighter::taskMarker(text);
+        };
+
+        const auto unchecked = marker(QStringLiteral("- [ ] one"));
+        QVERIFY(unchecked.isValid());
+        QCOMPARE(unchecked.start, 2);
+        QCOMPARE(unchecked.length, 3);
+        QVERIFY(!unchecked.checked);
+
+        const auto checked = marker(QStringLiteral("   1. [X] done"));
+        QVERIFY(checked.isValid());
+        QCOMPARE(checked.start, 6);
+        QVERIFY(checked.checked);
+
+        const auto bare = marker(QStringLiteral("* [ ]"));
+        QVERIFY(bare.isValid());
+        QCOMPARE(bare.start, 2);
+
+        // The marker needs a list item and whitespace (or the line end) after
+        // the closing bracket.
+        QVERIFY(!marker(QStringLiteral("- [ ]task")).isValid());
+        QVERIFY(!marker(QStringLiteral("plain [ ] text")).isValid());
+        QVERIFY(!marker(QStringLiteral("- [y] task")).isValid());
+        QVERIFY(!marker(QStringLiteral("> - [ ] quote")).isValid());
+    }
+
+    void findsImageEmbeds() {
+        const auto embed = [](const QString &text) {
+            return MarkdownHighlighter::imageEmbed(text);
+        };
+
+        // Obsidian's embed, with and without a width, and Markdown's, whose
+        // path may hold spaces or a title.
+        const auto wiki = embed(QStringLiteral("![[Screenshot 2026-11-10.png]]"));
+        QVERIFY(wiki.isValid());
+        QVERIFY(wiki.wiki);
+        QCOMPARE(wiki.target, QStringLiteral("Screenshot 2026-11-10.png"));
+        QCOMPARE(wiki.start, 0);
+        QCOMPARE(wiki.width, 0);
+
+        const auto sized = embed(QStringLiteral("  ![[diagram.png|300]]  "));
+        QVERIFY(sized.isValid());
+        QCOMPARE(sized.target, QStringLiteral("diagram.png"));
+        QCOMPARE(sized.width, 300);
+
+        const auto markdown = embed(QStringLiteral("![alt](<images/a b.png> \"title\")"));
+        QVERIFY(markdown.isValid());
+        QVERIFY(!markdown.wiki);
+        QCOMPARE(markdown.target, QStringLiteral("images/a b.png"));
+
+        const auto plain = embed(QStringLiteral("![](assets/pic.webp)"));
+        QVERIFY(plain.isValid());
+        QCOMPARE(plain.target, QStringLiteral("assets/pic.webp"));
+
+        // Only a line holding an embed is drawn as an image, and only an
+        // image file, so links and notes stay text.
+        QVERIFY(!embed(QStringLiteral("![[Note]]")).isValid());
+        QVERIFY(!embed(QStringLiteral("before ![[pic.png]]")).isValid());
+        QVERIFY(!embed(QStringLiteral("![]()")).isValid());
+        QVERIFY(!embed(QStringLiteral("![](page.html)")).isValid());
+        QVERIFY(MarkdownHighlighter::isImageFileName(QStringLiteral("PIC.JPEG")));
+        QVERIFY(!MarkdownHighlighter::isImageFileName(QStringLiteral("note.md")));
     }
 
     void searchIgnoresDiacriticsTheQueryLeavesOut() {
@@ -179,6 +254,34 @@ private slots:
         QCOMPARE(answer({QStringLiteral("-platform"), QStringLiteral("offscreen")}),
                  std::nullopt);
         QCOMPARE(answer({QStringLiteral("-notes.md")}), std::nullopt);
+        QVERIFY(usage.contains(QStringLiteral("--update")));
+    }
+
+    void findsTheCheckoutToUpdateFrom() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QByteArray previous = qgetenv("OMAWRITE_SOURCE_DIR");
+
+        // A folder without bin/install is not a checkout, and --update says
+        // so instead of running anything.
+        qputenv("OMAWRITE_SOURCE_DIR", dir.path().toLocal8Bit());
+        QCOMPARE(Cli::sourceDirectory(), QString());
+        QCOMPARE(Cli::handleArguments({QStringLiteral("omawrite"), QStringLiteral("--update")},
+                                      QStringLiteral("1.2.3")),
+                 std::optional<int>(1));
+
+        QVERIFY(QDir(dir.path()).mkpath(QStringLiteral("bin")));
+        QFile script(QDir(dir.path()).filePath(QStringLiteral("bin/install")));
+        QVERIFY(script.open(QIODevice::WriteOnly));
+        script.write("#!/usr/bin/env sh\n");
+        script.close();
+        QVERIFY(script.setPermissions(script.permissions() | QFileDevice::ExeOwner));
+        QCOMPARE(Cli::sourceDirectory(), QDir(dir.path()).absolutePath());
+
+        if (previous.isNull())
+            qunsetenv("OMAWRITE_SOURCE_DIR");
+        else
+            qputenv("OMAWRITE_SOURCE_DIR", previous);
     }
 
     void printsInPointsNotPixels() {
@@ -244,6 +347,563 @@ private slots:
         QVERIFY(MarkdownHighlighter::inlineMarkup(QStringLiteral("`~~x~~`")).isEmpty());
         QVERIFY(MarkdownHighlighter::inlineMarkup(QStringLiteral("a ~~ b ~~ c")).isEmpty());
         QVERIFY(MarkdownHighlighter::inlineMarkup(QStringLiteral("~~~x~~~")).isEmpty());
+    }
+
+    void findsWikilinks() {
+        const QString text = QStringLiteral(
+            "See [[Note]] and [[Other|alias]] and [[Third#Heading]].");
+        const auto markup = MarkdownHighlighter::inlineMarkup(text);
+        QCOMPARE(markup.size(), 3);
+
+        QCOMPARE(markup.at(0).kind, MarkdownHighlighter::InlineKind::WikiLink);
+        QCOMPARE(markup.at(0).content.start, int(text.indexOf(QStringLiteral("Note"))));
+        QCOMPARE(markup.at(0).content.length, 4);
+        QCOMPARE(markup.at(0).destination.start, int(text.indexOf(QStringLiteral("Note"))));
+        QCOMPARE(markup.at(0).destination.length, 4);
+
+        QCOMPARE(markup.at(1).kind, MarkdownHighlighter::InlineKind::WikiLink);
+        QCOMPARE(markup.at(1).content.start, int(text.indexOf(QStringLiteral("alias"))));
+        QCOMPARE(markup.at(1).content.length, 5);
+        QCOMPARE(markup.at(1).destination.start, int(text.indexOf(QStringLiteral("Other"))));
+        QCOMPARE(markup.at(1).destination.length, 5);
+        QCOMPARE(markup.at(1).markers[0].start,
+                 int(text.indexOf(QStringLiteral("[[Other"))));
+
+        QCOMPARE(markup.at(2).destination.start, int(text.indexOf(QStringLiteral("Third"))));
+        QCOMPARE(markup.at(2).destination.length, 5);
+        QCOMPARE(markup.at(2).content.length,
+                 int(QStringLiteral("Third#Heading").size()));
+    }
+
+    void keepsWikilinksLiteralInCode() {
+        QVERIFY(MarkdownHighlighter::inlineMarkup(QStringLiteral("`[[Note]]`")).isEmpty());
+
+        const QString text = QStringLiteral("See [[Note|alias]].");
+        QCOMPARE(MarkdownHighlighter::wikiLinkTargetAt(text, int(text.indexOf(QStringLiteral("Note")))),
+                 QStringLiteral("Note"));
+        QCOMPARE(MarkdownHighlighter::wikiLinkTargetAt(text, int(text.indexOf(QStringLiteral("alias")))),
+                 QStringLiteral("Note"));
+        QVERIFY(MarkdownHighlighter::wikiLinkTargetAt(text, 0).isEmpty());
+    }
+
+    void suggestsNotesAcrossTheSlipbox() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("ai")));
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Note.md")));
+        QVERIFY(write(QStringLiteral("ai/Note.md")));
+        QVERIFY(write(QStringLiteral("ai/skill list.md")));
+        QVERIFY(write(QStringLiteral("Branding.md")));
+        QVERIFY(write(QStringLiteral("current.md")));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("current.md"))));
+        QCOMPARE(backend.documentFolder(), QUrl::fromLocalFile(root.path()));
+        backend.refreshNoteIndex();
+
+        const QVariantList all = backend.noteSuggestions(QString());
+        QCOMPARE(all.size(), 5);
+        QCOMPARE(all.constFirst().toMap().value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Branding"));
+
+        const QVariantList notes = backend.noteSuggestions(QStringLiteral("note"));
+        QCOMPARE(notes.size(), 2);
+        bool sawRoot = false;
+        bool sawNested = false;
+        for (const QVariant &value : notes) {
+            const QVariantMap note = value.toMap();
+            const QString path = note.value(QStringLiteral("path")).toString();
+            if (path == QStringLiteral("Note.md")) {
+                QCOMPARE(note.value(QStringLiteral("insert")).toString(), QStringLiteral("Note"));
+                sawRoot = true;
+            } else if (path == QStringLiteral("ai/Note.md")) {
+                QCOMPARE(note.value(QStringLiteral("insert")).toString(),
+                         QStringLiteral("ai/Note"));
+                sawNested = true;
+            }
+        }
+        QVERIFY(sawRoot);
+        QVERIFY(sawNested);
+
+        QCOMPARE(backend.resolveNote(QStringLiteral("Branding")),
+                 QUrl::fromLocalFile(root.filePath(QStringLiteral("Branding.md"))));
+        QCOMPARE(backend.resolveNote(QStringLiteral("ai/Note")),
+                 QUrl::fromLocalFile(root.filePath(QStringLiteral("ai/Note.md"))));
+        QCOMPARE(backend.resolveNote(QStringLiteral("skill list")),
+                 QUrl::fromLocalFile(root.filePath(QStringLiteral("ai/skill list.md"))));
+        QCOMPARE(backend.resolveNote(QStringLiteral("Note")),
+                 QUrl::fromLocalFile(root.filePath(QStringLiteral("Note.md"))));
+        QVERIFY(backend.resolveNote(QStringLiteral("missing")).isEmpty());
+    }
+
+    void listsNotesThatLinkToTheOpenNote() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("ai")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Target.md"), "# target\n"));
+        QVERIFY(write(QStringLiteral("Plain.md"), "see [[Target]] and [[target|alias]]\nnothing\n"));
+        QVERIFY(write(QStringLiteral("ai/Nested.md"),
+                      "![[Target#Heading]]\n[md](../Target.md)\n```\n[[Target]]\n```\n"));
+        QVERIFY(write(QStringLiteral("Other.md"), "[[Targets]] and [[ai/Target]]\n"));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Target.md"))));
+        const QVariantList links = backend.backlinks();
+        QCOMPARE(links.size(), 2);
+        const QVariantMap nested = links.at(0).toMap();
+        QCOMPARE(nested.value(QStringLiteral("name")).toString(), QStringLiteral("Nested"));
+        // The embed and the Markdown link count; the fenced example does not.
+        QCOMPARE(nested.value(QStringLiteral("count")).toInt(), 2);
+        const QVariantMap plain = links.at(1).toMap();
+        QCOMPARE(plain.value(QStringLiteral("name")).toString(), QStringLiteral("Plain"));
+        // Two links on one line are one mention of the note's text.
+        QCOMPARE(plain.value(QStringLiteral("count")).toInt(), 1);
+        QCOMPARE(plain.value(QStringLiteral("mentions")).toList().constFirst().toMap()
+                     .value(QStringLiteral("line")).toInt(), 1);
+    }
+
+    void opensLinkedNotesInTabsWithoutDuplicates() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        for (const char *name : {"A.md", "B.md", "C.md"}) {
+            QFile file(root.filePath(QString::fromLatin1(name)));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("# note\n\nsome text\n");
+        }
+        const auto url = [&root](const char *name) {
+            return QUrl::fromLocalFile(root.filePath(QString::fromLatin1(name)));
+        };
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        const auto tabCount = [window]() { return window->property("tabs").toList().size(); };
+        QObject *strip = window->findChild<QObject *>(QStringLiteral("tabStrip"));
+        QVERIFY(strip);
+
+        backend.open(url("A.md"));
+        QCOMPARE(tabCount(), 1);
+        QVERIFY(!strip->property("visible").toBool());
+
+        QObject *tabEditor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(tabEditor);
+        tabEditor->setProperty("cursorPosition", 12);
+        QMetaObject::invokeMethod(window, "openInTab", Q_ARG(QVariant, url("B.md")));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("B.md"));
+        QMetaObject::invokeMethod(window, "openInTab", Q_ARG(QVariant, url("C.md")));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("C.md"));
+        QCOMPARE(tabCount(), 3);
+        QCOMPARE(window->property("activeTab").toInt(), 2);
+        QVERIFY(strip->property("visible").toBool());
+
+        // A note already in a tab is switched to, not opened a second time.
+        QMetaObject::invokeMethod(window, "openInTab", Q_ARG(QVariant, url("A.md")));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("A.md"));
+        QCOMPARE(tabCount(), 3);
+        QCOMPARE(window->property("activeTab").toInt(), 0);
+        // The caret is where it was left in that tab.
+        QTRY_COMPARE(tabEditor->property("cursorPosition").toInt(), 12);
+
+        QTest::keyClick(window, Qt::Key_2, Qt::ControlModifier);
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("B.md"));
+        QTest::keyClick(window, Qt::Key_9, Qt::ControlModifier);
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("C.md"));
+
+        QTest::keyClick(window, Qt::Key_W, Qt::ControlModifier);
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("B.md"));
+        QCOMPARE(tabCount(), 2);
+        QCOMPARE(window->property("activeTab").toInt(), 1);
+    }
+
+    void showsAFileViewerOfTheSlipbox() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("ai/deep")));
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Top.md")));
+        QVERIFY(write(QStringLiteral("ai/Nested.md")));
+        QVERIFY(write(QStringLiteral("ai/deep/Deeper.md")));
+        QVERIFY(write(QStringLiteral("ai/image.png")));
+        QVERIFY(write(QStringLiteral("zeta.markdown")));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("ai/deep/Deeper.md"))));
+        QCOMPARE(backend.fileTreeRoot(), QDir(dir.path()).absolutePath());
+        QCOMPARE(backend.fileTreeCurrentPath(), QStringLiteral("ai/deep/Deeper.md"));
+
+        // One level at a time: folders first, then notes, no dot folders and
+        // nothing that is not Markdown.
+        const QVariantList top = backend.listFolder(QString());
+        QCOMPARE(top.size(), 3);
+        QCOMPARE(top.at(0).toMap().value(QStringLiteral("name")).toString(), QStringLiteral("ai"));
+        QVERIFY(top.at(0).toMap().value(QStringLiteral("isDir")).toBool());
+        QCOMPARE(top.at(1).toMap().value(QStringLiteral("name")).toString(), QStringLiteral("Top"));
+        QCOMPARE(top.at(2).toMap().value(QStringLiteral("name")).toString(), QStringLiteral("zeta"));
+        QCOMPARE(backend.listFolder(QStringLiteral("ai")).size(), 2);
+        QVERIFY(backend.listFolder(QStringLiteral("../")).isEmpty());
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *viewer = window->findChild<QObject *>(QStringLiteral("fileViewer"));
+        QObject *list = window->findChild<QObject *>(QStringLiteral("fileViewerList"));
+        QVERIFY(viewer);
+        QVERIFY(list);
+        // Opened with a file, so the viewer waits for Ctrl+O, which also
+        // unfolds the way to the open note.
+        QVERIFY(!viewer->property("visible").toBool());
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTRY_VERIFY(viewer->property("visible").toBool());
+        // Links mode is the default: every note is a root here, sorted by
+        // name, so Deeper, Nested, Top, zeta.
+        QCOMPARE(backend.treeMode(), QStringLiteral("links"));
+        QTRY_COMPARE(list->property("count").toInt(), 4);
+
+        // Opening a note from the tree puts it in a tab.
+        QMetaObject::invokeMethod(window, "activateTreeRow", Q_ARG(QVariant, 2));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Top.md"));
+        QCOMPARE(window->property("tabs").toList().size(), 2);
+
+        // Folders mode still walks the disk: folders first, then notes, no
+        // dot folders and nothing that is not Markdown.
+        QObject *foldersButton = window->findChild<QObject *>(QStringLiteral("treeModeFolders"));
+        QVERIFY(foldersButton);
+        QVERIFY(QMetaObject::invokeMethod(foldersButton, "clicked"));
+        QTRY_COMPARE(list->property("count").toInt(), 3);
+
+        // A folder folds open and shut again.
+        QMetaObject::invokeMethod(window, "activateTreeRow", Q_ARG(QVariant, 0));
+        QTRY_COMPARE(list->property("count").toInt(), 5);
+        QMetaObject::invokeMethod(window, "activateTreeRow", Q_ARG(QVariant, 0));
+        QTRY_COMPARE(list->property("count").toInt(), 3);
+
+        // The header's collapse button hides the tree without the keyboard.
+        QObject *collapseButton = window->findChild<QObject *>(QStringLiteral("treeCollapse"));
+        QVERIFY(collapseButton);
+        QVERIFY(QMetaObject::invokeMethod(collapseButton, "clicked"));
+        QTRY_VERIFY(!viewer->property("visible").toBool());
+
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTRY_VERIFY(viewer->property("visible").toBool());
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QTRY_VERIFY(!viewer->property("visible").toBool());
+    }
+
+    void settingsDialogChangesScrollSpeed() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Note.md")));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Note.md"))));
+        QObject *settingsButton = window->findChild<QObject *>(QStringLiteral("settingsButton"));
+        QObject *dialog = window->findChild<QObject *>(QStringLiteral("settingsDialog"));
+        QVERIFY(settingsButton);
+        QVERIFY(dialog);
+        QVERIFY(!dialog->property("opened").toBool());
+        QVERIFY(QMetaObject::invokeMethod(settingsButton, "clicked"));
+        QTRY_VERIFY(dialog->property("opened").toBool());
+
+        // The dialog lists every rebindable action, and the speed field edits
+        // the shared setting the editor and the tree both read.
+        QVERIFY(dialog->property("rows").toList().size() >= 30);
+        QObject *speedField = dialog->findChild<QObject *>(QStringLiteral("scrollSpeedField"));
+        QVERIFY(speedField);
+        QCOMPARE(speedField->property("text").toString(), QStringLiteral("2.0"));
+        speedField->setProperty("text", QStringLiteral("1.5"));
+        QVERIFY(QMetaObject::invokeMethod(speedField, "editingFinished"));
+        QTRY_COMPARE(backend.scrollSpeed(), 1.5);
+
+        // Key edits apply live through the bindings: Ctrl+O stops toggling
+        // the viewer until the key is reset. The blank window opens the
+        // viewer by itself, so close it and the modal dialog first.
+        QVERIFY(QMetaObject::invokeMethod(dialog, "close"));
+        QTRY_VERIFY(!dialog->property("opened").toBool());
+        QObject *viewer = window->findChild<QObject *>(QStringLiteral("fileViewer"));
+        QVERIFY(viewer);
+        QVERIFY(viewer->property("visible").toBool());
+        QMetaObject::invokeMethod(window, "toggleSidebar");
+        QTRY_VERIFY(!viewer->property("visible").toBool());
+        QObject *sidebarShortcut =
+            window->findChild<QObject *>(QStringLiteral("toggleSidebarShortcut"));
+        QVERIFY(sidebarShortcut);
+        QCOMPARE(sidebarShortcut->property("sequence").toString(), QStringLiteral("Ctrl+O"));
+        QVERIFY(backend.setShortcut(QStringLiteral("toggle-sidebar"),
+                                    QStringLiteral("Ctrl+E")));
+        QTRY_COMPARE(sidebarShortcut->property("sequence").toString(),
+                     QStringLiteral("Ctrl+E"));
+        backend.resetShortcut(QStringLiteral("toggle-sidebar"));
+        QTRY_COMPARE(sidebarShortcut->property("sequence").toString(),
+                     QStringLiteral("Ctrl+O"));
+        backend.setScrollSpeed(2.0);
+    }
+
+    void searchesOtherNotesFromQuickOpen() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [&root](const QString &name, const QByteArray &text) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(text);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Branding.md"), "# Branding\n"));
+        QVERIFY(write(QStringLiteral("Note.md"), "# Note\n"));
+        QVERIFY(write(QStringLiteral("current.md"), "# Current\n"));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *quickOpen = window->findChild<QObject *>(QStringLiteral("quickOpen"));
+        QObject *field = window->findChild<QObject *>(QStringLiteral("quickOpenField"));
+        QObject *list = window->findChild<QObject *>(QStringLiteral("quickOpenList"));
+        QVERIFY(quickOpen);
+        QVERIFY(field);
+        QVERIFY(list);
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("current.md"))));
+        QMetaObject::invokeMethod(window, "openQuickOpen");
+        QTRY_VERIFY(quickOpen->property("visible").toBool());
+        QTRY_VERIFY(field->property("activeFocus").toBool());
+        QCOMPARE(field->property("placeholderText").toString(),
+                 QStringLiteral("Open other file…"));
+
+        for (const QChar character : QStringLiteral("brand"))
+            QTest::keyClick(window, character.toLatin1());
+        QCOMPARE(field->property("text").toString(), QStringLiteral("brand"));
+        QCOMPARE(field->property("placeholderText").toString(), QString());
+        QTRY_COMPARE(list->property("count").toInt(), 1);
+        QCOMPARE(list->property("currentIndex").toInt(), 0);
+
+        QMetaObject::invokeMethod(window, "openQuickOpenSelection");
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Branding.md"));
+        QVERIFY(!quickOpen->property("visible").toBool());
+    }
+
+    void alignsWrappedListLinesWithTheirText() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *quickDocument = qobject_cast<QQuickTextDocument *>(
+            editor->property("textDocument").value<QObject *>());
+        QVERIFY(quickDocument);
+        QTextDocument *document = quickDocument->textDocument();
+
+        editor->setProperty("text", QStringLiteral(
+            "- a list item with enough words to wrap at this width and keep going "
+            "until it has several lines to check\n"
+            "    - a nested item with enough words to wrap at this width and keep "
+            "going until it has several lines to check\n"
+            "- [ ] a task item with enough words to wrap at this width and keep "
+            "going until it has several lines to check"));
+        document->documentLayout()->documentSize();
+
+        int listItems = 0;
+        for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
+            const QTextBlockFormat format = block.blockFormat();
+            QVERIFY(format.indent() > 0);
+            QVERIFY(format.textIndent() < 0);
+            QVERIFY(block.layout()->lineCount() > 1);
+            QVERIFY(block.layout()->lineAt(1).x() > 0);
+            QVERIFY(qAbs(block.layout()->lineAt(1).x() - format.indent()) < 1.0);
+            ++listItems;
+        }
+        QCOMPARE(listItems, 3);
+    }
+
+    void clickingTheEditorStillPlacesTheCaret() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *item = qobject_cast<QQuickItem *>(editor);
+        QVERIFY(item);
+
+        editor->setProperty("text", QStringLiteral("hello world"));
+        QTest::qWait(20);
+        QRectF box;
+        QMetaObject::invokeMethod(editor, "positionToRectangle", Q_RETURN_ARG(QRectF, box),
+                                  Q_ARG(int, 6));
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          item->mapToScene(box.center()).toPoint());
+        QVERIFY(qAbs(editor->property("cursorPosition").toInt() - 6) <= 1);
+    }
+
+    void draggingTheEditorStillSelectsText() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *item = qobject_cast<QQuickItem *>(editor);
+        QVERIFY(item);
+
+        editor->setProperty("text", QStringLiteral("hello world"));
+        QTest::qWait(20);
+        QRectF first;
+        QRectF last;
+        QMetaObject::invokeMethod(editor, "positionToRectangle", Q_RETURN_ARG(QRectF, first),
+                                  Q_ARG(int, 1));
+        QMetaObject::invokeMethod(editor, "positionToRectangle", Q_RETURN_ARG(QRectF, last),
+                                  Q_ARG(int, 7));
+        const QPoint from = item->mapToScene(first.center()).toPoint();
+        const QPoint to = item->mapToScene(last.center()).toPoint();
+        QTest::mousePress(window, Qt::LeftButton, Qt::NoModifier, from);
+        QTest::mouseMove(window, to);
+        QTest::mouseRelease(window, Qt::LeftButton, Qt::NoModifier, to);
+        QVERIFY(editor->property("selectionEnd").toInt()
+                > editor->property("selectionStart").toInt());
+    }
+
+    void ctrlClicksWikiLinks() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QFile current(root.filePath(QStringLiteral("current.md")));
+        QVERIFY(current.open(QIODevice::WriteOnly));
+        current.write("See [[Other]] here\n");
+        current.close();
+        QFile other(root.filePath(QStringLiteral("Other.md")));
+        QVERIFY(other.open(QIODevice::WriteOnly));
+        other.write("# Other\n");
+        other.close();
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *item = qobject_cast<QQuickItem *>(editor);
+        QVERIFY(item);
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("current.md"))));
+        QCOMPARE(editor->property("text").toString(), QStringLiteral("See [[Other]] here\n"));
+        QTest::qWait(20);
+        QRectF box;
+        QMetaObject::invokeMethod(editor, "positionToRectangle", Q_RETURN_ARG(QRectF, box),
+                                  Q_ARG(int, 8));
+        QTest::mouseClick(window, Qt::LeftButton, Qt::ControlModifier,
+                          item->mapToScene(box.center()).toPoint());
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Other.md"));
     }
 
     void undoesAnEditInOneStep() {
@@ -313,6 +973,284 @@ private slots:
         QMetaObject::invokeMethod(editor, "paste");
         QCOMPARE(editor->property("text").toString(), QStringLiteral("X\nY\ncc"));
         QVERIFY(allLinesSpaced());
+    }
+
+    void pastesAClipboardImageIntoAnObsidianVault() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("attachments")));
+        {
+            QFile config(root.filePath(QStringLiteral(".obsidian/app.json")));
+            QVERIFY(config.open(QIODevice::WriteOnly));
+            config.write("{\"attachmentFolderPath\": \"attachments\"}");
+        }
+        const QString notePath = root.filePath(QStringLiteral("Inbox.md"));
+        {
+            QFile note(notePath);
+            QVERIFY(note.open(QIODevice::WriteOnly));
+            note.write("# Inbox\n");
+        }
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+
+        backend.open(QUrl::fromLocalFile(notePath));
+        QCOMPARE(backend.fileName(), QStringLiteral("Inbox.md"));
+        editor->setProperty("cursorPosition", editor->property("text").toString().length());
+
+        QImage screenshot(64, 32, QImage::Format_ARGB32);
+        screenshot.fill(Qt::red);
+        QGuiApplication::clipboard()->setImage(screenshot);
+        QMetaObject::invokeMethod(editor, "forceActiveFocus");
+        QTest::keyClick(window, Qt::Key_V, Qt::ControlModifier);
+
+        // The image is saved under Obsidian's own attachment folder and
+        // embedded the way Obsidian writes it, so the vault reads alike in
+        // either app.
+        QTRY_VERIFY2(editor->property("text").toString().contains(QStringLiteral("![[Pasted image")),
+                     qPrintable(editor->property("text").toString()));
+        const QString text = editor->property("text").toString();
+        static const QRegularExpression embedRe(
+            QStringLiteral("!\\[\\[(Pasted image \\d{14}(?: \\d+)?\\.png)\\]\\]"));
+        const QRegularExpressionMatch embed = embedRe.match(text);
+        QVERIFY2(embed.hasMatch(), qPrintable(text));
+
+        const QFileInfo image(root.filePath(QStringLiteral("attachments/") + embed.captured(1)));
+        QVERIFY2(image.isFile(), qPrintable(image.absoluteFilePath()));
+        QCOMPARE(QImageReader(image.absoluteFilePath()).size(), QSize(64, 32));
+
+        // The note shows the image itself, and the line keeps the room for it.
+        QCOMPARE(backend.imageEmbeds().size(), 1);
+        QObject *previews = window->findChild<QObject *>(QStringLiteral("imagePreviews"));
+        QVERIFY(previews);
+        QTRY_COMPARE(previews->property("count").toInt(), 1);
+        QQuickItem *preview = nullptr;
+        QVERIFY(QMetaObject::invokeMethod(previews, "itemAt",
+                                          Q_RETURN_ARG(QQuickItem *, preview), Q_ARG(int, 0)));
+        QVERIFY(preview);
+        QCOMPARE(preview->objectName(), QStringLiteral("imagePreview"));
+        QCOMPARE(preview->property("imageUrl").toUrl(), QUrl::fromLocalFile(image.absoluteFilePath()));
+        auto *quickDocument = qobject_cast<QQuickTextDocument *>(
+            editor->property("textDocument").value<QObject *>());
+        QVERIFY(quickDocument);
+        QTRY_VERIFY(quickDocument->textDocument()->lastBlock().blockFormat().bottomMargin() > 0);
+    }
+
+    void pastesClipboardImagesBesidePlainNotes() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString notePath = QDir(dir.path()).filePath(QStringLiteral("Note.md"));
+        {
+            QFile note(notePath);
+            QVERIFY(note.open(QIODevice::WriteOnly));
+            note.write("# Note\n");
+        }
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(notePath));
+
+        QImage image(20, 10, QImage::Format_ARGB32);
+        image.fill(Qt::blue);
+        QGuiApplication::clipboard()->setImage(image);
+        const QVariantMap result = backend.pasteClipboardImage();
+        QVERIFY(result.value(QStringLiteral("handled")).toBool());
+
+        const QString text = result.value(QStringLiteral("text")).toString();
+        static const QRegularExpression embedRe(
+            QStringLiteral("^!\\[\\]\\((_attachments/Pasted%20image%20\\d{14}(?:%20\\d+)?\\.png)\\)$"));
+        const QRegularExpressionMatch embed = embedRe.match(text);
+        QVERIFY2(embed.hasMatch(), qPrintable(text));
+
+        // A folder outside a vault gets a Markdown path, relative to the note.
+        const QString path = QDir(dir.path()).filePath(QUrl::fromPercentEncoding(
+            embed.captured(1).toUtf8()));
+        QVERIFY2(QFileInfo::exists(path), qPrintable(path));
+        QCOMPARE(QImageReader(path).size(), QSize(20, 10));
+    }
+
+    void pastesImagesAtTheVaultRootByDefault() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const QString notePath = root.filePath(QStringLiteral("Note.md"));
+        {
+            QFile note(notePath);
+            QVERIFY(note.open(QIODevice::WriteOnly));
+            note.write("# Note\n");
+        }
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(notePath));
+
+        // A new vault has no attachment folder setting, and Obsidian puts
+        // pasted images at the vault root.
+        QImage image(8, 8, QImage::Format_ARGB32);
+        image.fill(Qt::green);
+        QGuiApplication::clipboard()->setImage(image);
+        const QVariantMap result = backend.pasteClipboardImage();
+        QVERIFY(result.value(QStringLiteral("handled")).toBool());
+
+        const QString text = result.value(QStringLiteral("text")).toString();
+        static const QRegularExpression embedRe(
+            QStringLiteral("^!\\[\\[(Pasted image \\d{14}(?: \\d+)?\\.png)\\]\\]$"));
+        const QRegularExpressionMatch embed = embedRe.match(text);
+        QVERIFY2(embed.hasMatch(), qPrintable(text));
+        QVERIFY2(QFileInfo::exists(root.filePath(embed.captured(1))), qPrintable(text));
+    }
+
+    void pastesImagesUnderTheNotesFolderWhenTheVaultAsks() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("notes")));
+        {
+            QFile config(root.filePath(QStringLiteral(".obsidian/app.json")));
+            QVERIFY(config.open(QIODevice::WriteOnly));
+            config.write("{\"attachmentFolderPath\": \"./_attachments\"}");
+        }
+        const QString notePath = root.filePath(QStringLiteral("notes/Inbox.md"));
+        {
+            QFile note(notePath);
+            QVERIFY(note.open(QIODevice::WriteOnly));
+            note.write("# Inbox\n");
+        }
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(notePath));
+        QImage image(16, 16, QImage::Format_ARGB32);
+        image.fill(Qt::yellow);
+        QGuiApplication::clipboard()->setImage(image);
+        const QVariantMap result = backend.pasteClipboardImage();
+        QVERIFY(result.value(QStringLiteral("handled")).toBool());
+
+        static const QRegularExpression embedRe(
+            QStringLiteral("^!\\[\\[(Pasted image \\d{14}(?: \\d+)?\\.png)\\]\\]$"));
+        const QString text = result.value(QStringLiteral("text")).toString();
+        const QRegularExpressionMatch embed = embedRe.match(text);
+        QVERIFY2(embed.hasMatch(), qPrintable(text));
+        QVERIFY2(QFileInfo::exists(root.filePath(
+                     QStringLiteral("notes/_attachments/") + embed.captured(1))),
+                 qPrintable(text));
+    }
+
+    void opensImagesFullWindowAndStepsThroughThem() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        const auto writeImage = [&root](const QString &name, const QColor &color) {
+            QImage image(900, 600, QImage::Format_ARGB32);
+            image.fill(color);
+            return image.save(root.filePath(name));
+        };
+        QVERIFY(writeImage(QStringLiteral("one.png"), Qt::red));
+        QVERIFY(writeImage(QStringLiteral("two.png"), Qt::blue));
+        const QString notePath = root.filePath(QStringLiteral("Note.md"));
+        {
+            QFile note(notePath);
+            QVERIFY(note.open(QIODevice::WriteOnly));
+            note.write("# Note\n\n![[one.png]]\n\n![[two.png]]\n");
+        }
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QObject *previews = window->findChild<QObject *>(QStringLiteral("imagePreviews"));
+        QObject *viewer = window->findChild<QObject *>(QStringLiteral("imageViewer"));
+        QObject *picture = window->findChild<QObject *>(QStringLiteral("imageViewerPicture"));
+        QObject *previous = window->findChild<QObject *>(QStringLiteral("imageViewerPrevious"));
+        QObject *next = window->findChild<QObject *>(QStringLiteral("imageViewerNext"));
+        QVERIFY(editor);
+        QVERIFY(previews);
+        QVERIFY(viewer);
+        QVERIFY(picture);
+        QVERIFY(previous);
+        QVERIFY(next);
+        QVERIFY(!viewer->property("visible").toBool());
+
+        backend.open(QUrl::fromLocalFile(notePath));
+        QTRY_COMPARE(previews->property("count").toInt(), 2);
+        QQuickItem *firstPreview = nullptr;
+        QVERIFY(QMetaObject::invokeMethod(previews, "itemAt",
+                                          Q_RETURN_ARG(QQuickItem *, firstPreview), Q_ARG(int, 0)));
+        QVERIFY(firstPreview);
+        editor->setProperty("cursorPosition", 0);
+        QTest::qWait(30);
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          firstPreview->mapToScene(QPointF(firstPreview->width() / 2,
+                                                          firstPreview->height() / 2)).toPoint());
+
+        // The viewer covers the whole window and starts on the clicked
+        // picture, at its own size rather than stretched to the window.
+        QTRY_VERIFY(viewer->property("visible").toBool());
+        QTRY_VERIFY(viewer->property("activeFocus").toBool());
+        QCOMPARE(qRound(viewer->property("width").toReal()), window->width());
+        QCOMPARE(qRound(viewer->property("height").toReal()), window->height());
+        QTRY_COMPARE(picture->property("source").toUrl(),
+                     QUrl::fromLocalFile(root.filePath(QStringLiteral("one.png"))));
+        QCOMPARE(qRound(picture->property("width").toReal()), 900);
+        QCOMPARE(qRound(picture->property("height").toReal()), 600);
+        QVERIFY(!previous->property("visible").toBool());
+        QVERIFY(next->property("visible").toBool());
+
+        // A click on the picture inspects it; only the space around it closes.
+        auto *pictureItem = qobject_cast<QQuickItem *>(picture);
+        QVERIFY(pictureItem);
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          pictureItem->mapToScene(QPointF(pictureItem->width() / 2,
+                                                         pictureItem->height() / 2)).toPoint());
+        QVERIFY(viewer->property("visible").toBool());
+
+        // The right chevron and the Right key both reach the next picture.
+        auto *nextButton = qobject_cast<QQuickItem *>(next);
+        QVERIFY(nextButton);
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          nextButton->mapToScene(QPointF(nextButton->width() / 2,
+                                                        nextButton->height() / 2)).toPoint());
+        QTRY_COMPARE(picture->property("source").toUrl(),
+                     QUrl::fromLocalFile(root.filePath(QStringLiteral("two.png"))));
+        QVERIFY(previous->property("visible").toBool());
+        QVERIFY(!next->property("visible").toBool());
+
+        QTest::keyClick(window, Qt::Key_Left);
+        QTRY_COMPARE(picture->property("source").toUrl(),
+                     QUrl::fromLocalFile(root.filePath(QStringLiteral("one.png"))));
+
+        // Escape closes, returns the caret to the picture's line, and gives
+        // the keyboard back to the editor.
+        const QVariantList embeds = backend.imageEmbeds();
+        QCOMPARE(embeds.size(), 2);
+        QTest::keyClick(window, Qt::Key_Escape);
+        QTRY_VERIFY(!viewer->property("visible").toBool());
+        QTRY_VERIFY(editor->property("activeFocus").toBool());
+        QCOMPARE(editor->property("cursorPosition").toInt(),
+                 embeds.first().toMap().value(QStringLiteral("blockEnd")).toInt());
     }
 
     void searchFollowsEditsWithoutTakingTheCaret() {
@@ -873,7 +1811,14 @@ private slots:
         QCOMPARE(MarkdownHighlighter::linkUrlAt(text, linkStart + 3),
                  QStringLiteral("https://example.com/docs"));
         QVERIFY(MarkdownHighlighter::linkUrlAt(text, linkStart - 1).isEmpty());
-        QVERIFY(MarkdownHighlighter::linkUrlAt(text, text.indexOf(QStringLiteral("https"))).isEmpty());
+        QCOMPARE(MarkdownHighlighter::linkUrlAt(text, text.indexOf(QStringLiteral("https"))),
+                 QStringLiteral("https://example.com/docs"));
+
+        // A bare URL is clickable too, without its sentence punctuation.
+        const QString bare = QStringLiteral("Read https://example.com/docs, then stop");
+        QCOMPARE(MarkdownHighlighter::linkUrlAt(bare, int(bare.indexOf(QStringLiteral("example")))),
+                 QStringLiteral("https://example.com/docs"));
+        QVERIFY(MarkdownHighlighter::linkUrlAt(bare, 0).isEmpty());
 
         // Escaped punctuation, as the editor writes for parentheses, reads as itself.
         const QString escaped = QStringLiteral(R"([wiki](https://example.com/a\(b\)))");
@@ -1251,6 +2196,36 @@ private slots:
         QVERIFY(document.firstBlock().layout()->formats().constFirst().format.fontPointSize() != 1.0);
         highlighter.setCaret(7);
         QCOMPARE(document.firstBlock().layout()->formats().constFirst().format.fontPointSize(), 1.0);
+    }
+
+    void hidesTaskCheckboxesAwayFromTheCaret() {
+        const QString text = QStringLiteral("- [ ] task");
+        // Away from the marker the three characters are hidden, and the run
+        // takes the width the editor draws the checkbox at. The caret just
+        // past the closing bracket is already out of it.
+        for (int caret : {0, 5, 6, 9}) {
+            const auto formats = highlightedFormats(text, caret);
+            for (int i : {2, 3, 4})
+                QCOMPARE(formats.at(i).fontPointSize(), 1.0);
+        }
+
+        // Inside it, the raw marker shows so it can be edited.
+        for (int caret : {2, 3, 4}) {
+            const auto formats = highlightedFormats(text, caret);
+            for (int i : {2, 3, 4}) {
+                QVERIFY(formats.at(i).fontPointSize() != 1.0);
+                QCOMPARE(formats.at(i).foreground().color(), QColor(QStringLiteral("#4f525a")));
+            }
+        }
+
+        QTextDocument document;
+        document.setPlainText(text);
+        MarkdownHighlighter highlighter(&document);
+        highlighter.setTheme(true, "#101010", "#eeeeee", "#5584aa", "#23372b");
+        highlighter.rehighlight();
+        const QTextLine line = document.firstBlock().layout()->lineAt(0);
+        const qreal reserved = line.cursorToX(5) - line.cursorToX(2);
+        QVERIFY(qAbs(reserved - MarkdownHighlighter::taskCheckboxWidth(document.defaultFont())) < 1.0);
     }
 
     void takesTheCodePanelFromTheTheme() {
@@ -1897,7 +2872,8 @@ private slots:
 
         QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
         QVERIFY(editor);
-        editor->setProperty("text", QStringLiteral("# Title\n\nFirst **bold**.\n\nSecond."));
+        editor->setProperty("text", QStringLiteral(
+            "# Title\n\nFirst **bold**.\n\nSecond.\n\n- [ ] one\n- [x] two"));
         backend.copyAsHtml();
 
         const QMimeData *mimeData = QGuiApplication::clipboard()->mimeData();
@@ -1908,9 +2884,11 @@ private slots:
         QVERIFY(html.contains(QStringLiteral("<p>First ")));
         QVERIFY(html.contains(QStringLiteral("<body>")));
         QVERIFY(html.contains(QStringLiteral("font-weight:700;\">bold</span>")));
+        QVERIFY(html.contains(QStringLiteral("class=\"unchecked\"")));
+        QVERIFY(html.contains(QStringLiteral("class=\"checked\"")));
         QVERIFY(!html.contains(QStringLiteral("font-family")));
         QVERIFY(!html.contains(QStringLiteral("margin")));
-        QCOMPARE(mimeData->text(), QStringLiteral("Title\nFirst bold.\nSecond."));
+        QCOMPARE(mimeData->text(), QStringLiteral("Title\nFirst bold.\nSecond.\none\ntwo"));
     }
 
     void flashesScrollBarOnlyWhenPaging() {
@@ -1978,6 +2956,9 @@ private slots:
 
         auto text = [&] { return editor->property("text").toString(); };
         auto load = [&](const QString &content, int position) {
+            // Park the caret first: shrinking the text under a caret near its
+            // old end makes QQuickTextEdit warn while it restores it.
+            editor->setProperty("cursorPosition", 0);
             editor->setProperty("text", content);
             editor->setProperty("cursorPosition", position);
         };
@@ -2022,12 +3003,121 @@ private slots:
         returnKey();
         QCOMPARE(text(), QStringLiteral("- item\n\n"));
 
+        // A task carries an unchecked checkbox down, even from a checked one,
+        // and an empty task ends the list. Ordered tasks keep their number.
+        load(QStringLiteral("- [ ] item"), 10);
+        returnKey();
+        QCOMPARE(text(), QStringLiteral("- [ ] item\n- [ ] "));
+        returnKey();
+        QCOMPARE(text(), QStringLiteral("- [ ] item\n\n"));
+        load(QStringLiteral("- [x] done"), 10);
+        returnKey();
+        QCOMPARE(text(), QStringLiteral("- [x] done\n- [ ] "));
+        load(QStringLiteral("1. [ ] one"), 10);
+        returnKey();
+        QCOMPARE(text(), QStringLiteral("1. [ ] one\n2. [ ] "));
+
         // Inside a code fence every line is its own, blank ones included.
         load(QStringLiteral("```\ncode\n```"), 8);
         returnKey();
         QCOMPARE(text(), QStringLiteral("```\ncode\n\n```"));
         returnKey();
         QCOMPARE(text(), QStringLiteral("```\ncode\n\n\n```"));
+    }
+
+    void togglesCheckboxes() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        QVERIFY2(object, qPrintable(component.errorString()));
+
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        QMetaObject::invokeMethod(editor, "forceActiveFocus");
+        QVERIFY(editor->property("activeFocus").toBool());
+
+        auto text = [&] { return editor->property("text").toString(); };
+        auto checkboxes = [&]() {
+            QList<QQuickItem *> found;
+            auto *editorItem = qobject_cast<QQuickItem *>(editor);
+            for (QQuickItem *child : editorItem->childItems()) {
+                if (child->objectName() == QStringLiteral("taskCheckbox"))
+                    found.append(child);
+            }
+            return found;
+        };
+        auto firstCheckbox = [&]() -> QQuickItem * {
+            const QList<QQuickItem *> found = checkboxes();
+            return found.isEmpty() ? nullptr : found.constFirst();
+        };
+
+        editor->setProperty("text", QStringLiteral("- [ ] one\n- [x] two"));
+        editor->setProperty("cursorPosition", 0);
+        QTRY_COMPARE(checkboxes().size(), 2);
+
+        // Clicking the drawn box toggles the Markdown without moving the caret.
+        QQuickItem *first = firstCheckbox();
+        QVERIFY(first);
+        QVERIFY(first->isVisible());
+        const int caret = editor->property("cursorPosition").toInt();
+        QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier,
+                          first->mapToScene(QPointF(first->width() / 2,
+                                                    first->height() / 2)).toPoint());
+        QTRY_COMPARE(text(), QStringLiteral("- [x] one\n- [x] two"));
+        QCOMPARE(editor->property("cursorPosition").toInt(), caret);
+
+        // One undo takes the toggle back.
+        QMetaObject::invokeMethod(editor, "undo");
+        QTRY_COMPARE(text(), QStringLiteral("- [ ] one\n- [x] two"));
+
+        // The raw marker shows, and the box hides, while the caret is inside it.
+        editor->setProperty("cursorPosition", 3);
+        QTRY_VERIFY(firstCheckbox() && !firstCheckbox()->isVisible());
+        editor->setProperty("cursorPosition", 8);
+        QTRY_VERIFY(firstCheckbox() && firstCheckbox()->isVisible());
+
+        // The keyboard toggles the item at the caret too.
+        QTest::keyClick(window, Qt::Key_Return, Qt::ControlModifier | Qt::ShiftModifier);
+        QTRY_COMPARE(text(), QStringLiteral("- [x] one\n- [x] two"));
+
+        // A bare marker at the end of the document still gets a box.
+        editor->setProperty("cursorPosition", 0);
+        editor->setProperty("text", QStringLiteral("- [ ]"));
+        editor->setProperty("cursorPosition", 0);
+        QTRY_COMPARE(checkboxes().size(), 1);
+        QVERIFY(firstCheckbox() && firstCheckbox()->isVisible());
+    }
+
+    void ignoresTasksInsideCodeFences() {
+        Backend backend;
+        QQuickTextDocument *quickDocument = attachTextEdit(&backend);
+        QVERIFY(quickDocument);
+        QTextDocument *document = quickDocument->textDocument();
+        document->setPlainText(QStringLiteral("```\n- [ ] code\n```\n- [x] real\n"));
+        QTRY_VERIFY(document->findBlockByNumber(1).userState()
+                    >= int(MarkdownHighlighter::InsideFence));
+
+        const QVariantList markers = backend.taskMarkers();
+        QCOMPARE(markers.size(), 1);
+        const QVariantMap marker = markers.constFirst().toMap();
+        QCOMPARE(marker.value(QStringLiteral("position")).toInt(), 21);
+        QVERIFY(marker.value(QStringLiteral("checked")).toBool());
+
+        // A line inside the fence is not a task, so it cannot be toggled.
+        QVERIFY(!backend.toggleTaskAt(6));
+        QCOMPARE(document->toPlainText(),
+                 QStringLiteral("```\n- [ ] code\n```\n- [x] real\n"));
     }
 
     void nestsListItemsOnTab() {
@@ -3356,6 +4446,169 @@ private slots:
         QObject *keep = dialog->findChild<QObject *>(QStringLiteral("keepButton"));
         QVERIFY(keep);
         QTRY_VERIFY(keep->property("activeFocus").toBool());
+    }
+
+    void readsUpsAndTagsFromFrontmatter() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("drawings")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Branding.md"), "---\ntags:\n  - atomic\n---\n# B\n"));
+        QVERIFY(write(QStringLiteral("Onboarding.md"),
+                      "---\nup:\n  - \"[[Branding]]\"\ntags:\n  - fleeting\n---\n# O\n"));
+        QVERIFY(write(QStringLiteral("Single.md"), "---\nup: \"[[Branding]]\"\n---\n# S\n"));
+        QVERIFY(write(QStringLiteral("Weird.md"), "---\nup:\n  type: choice\n---\n# W\n"));
+        QVERIFY(write(QStringLiteral("Plain.md"), "# no frontmatter\n"));
+        QVERIFY(write(QStringLiteral("Tagged.md"), "---\ntags: [atomic, fleeting]\n---\n# T\n"));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Branding.md"))));
+        backend.refreshNoteIndex();
+
+        const auto meta = [&backend](const QString &path) {
+            return backend.noteFrontmatter(path);
+        };
+        QCOMPARE(meta(QStringLiteral("Branding.md")).value(QStringLiteral("tags")).toStringList(),
+                 (QStringList{QStringLiteral("atomic")}));
+        QVERIFY(meta(QStringLiteral("Branding.md")).value(QStringLiteral("ups")).toStringList().isEmpty());
+        QCOMPARE(meta(QStringLiteral("Onboarding.md")).value(QStringLiteral("ups")).toStringList(),
+                 (QStringList{QStringLiteral("Branding")}));
+        QCOMPARE(meta(QStringLiteral("Onboarding.md")).value(QStringLiteral("tags")).toStringList(),
+                 (QStringList{QStringLiteral("fleeting")}));
+        QCOMPARE(meta(QStringLiteral("Single.md")).value(QStringLiteral("ups")).toStringList(),
+                 (QStringList{QStringLiteral("Branding")}));
+        // An object under up: is not a parent list.
+        QVERIFY(meta(QStringLiteral("Weird.md")).value(QStringLiteral("ups")).toStringList().isEmpty());
+        QVERIFY(meta(QStringLiteral("Plain.md")).value(QStringLiteral("tags")).toStringList().isEmpty());
+        QCOMPARE(meta(QStringLiteral("Tagged.md")).value(QStringLiteral("tags")).toStringList(),
+                 (QStringList{QStringLiteral("atomic"), QStringLiteral("fleeting")}));
+    }
+
+    void buildsAVirtFolderTreeFromUps() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("drawings")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("Branding.md"), "---\ntags:\n  - atomic\n---\n# B\n"));
+        QVERIFY(write(QStringLiteral("Zebra.md"),
+                      "---\nup:\n  - \"[[Branding]]\"\n---\n# Z\n"));
+        QVERIFY(write(QStringLiteral("Apple.md"),
+                      "---\nup:\n  - \"[[Branding]]\"\n---\n# A\n"));
+        QVERIFY(write(QStringLiteral("Orphan.md"), "# O\n"));
+        QVERIFY(write(QStringLiteral("drawings/Sketch.md"),
+                      "---\nup:\n  - \"[[Branding]]\"\n---\n# S\n"));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Branding.md"))));
+        const QVariantList tree = backend.virtFolderTree();
+
+        // Roots, sorted by name: Branding (with children) then Orphan. The
+        // drawings note is generated output, not a knowledge note.
+        QCOMPARE(tree.size(), 2);
+        const QVariantMap branding = tree.at(0).toMap();
+        QCOMPARE(branding.value(QStringLiteral("name")).toString(), QStringLiteral("Branding"));
+        QCOMPARE(branding.value(QStringLiteral("childCount")).toInt(), 2);
+        const QVariantList children = branding.value(QStringLiteral("children")).toList();
+        QCOMPARE(children.size(), 2);
+        QCOMPARE(children.at(0).toMap().value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Apple"));
+        QCOMPARE(children.at(1).toMap().value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Zebra"));
+        QCOMPARE(tree.at(1).toMap().value(QStringLiteral("name")).toString(),
+                 QStringLiteral("Orphan"));
+    }
+
+    void virtTreeSurvivesALinkCycle() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("A.md"), "---\nup:\n  - \"[[B]]\"\n---\n# A\n"));
+        QVERIFY(write(QStringLiteral("B.md"), "---\nup:\n  - \"[[A]]\"\n---\n# B\n"));
+
+        Backend backend;
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("A.md"))));
+        const QVariantList tree = backend.virtFolderTree();
+        // A nests B under itself; B's back-link to A is cut instead of
+        // recursing, so every note still shows up exactly once.
+        QCOMPARE(tree.size(), 1);
+        int total = 0;
+        const std::function<void(const QVariantList &)> count = [&](const QVariantList &rows) {
+            for (const QVariant &row : rows) {
+                ++total;
+                count(row.toMap().value(QStringLiteral("children")).toList());
+            }
+        };
+        count(tree);
+        QCOMPARE(total, 2);
+    }
+
+    void shortcutDefaultsCanBeOverriddenAndReset() {
+        Backend backend;
+        QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+O")}));
+        QVERIFY(!backend.shortcutIds().isEmpty());
+        QVERIFY(!backend.shortcutDescription(QStringLiteral("toggle-sidebar")).isEmpty());
+
+        QVERIFY(backend.setShortcut(QStringLiteral("toggle-sidebar"), QStringLiteral("Ctrl+E")));
+        QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+E")}));
+        // A second Backend in the same settings scope picks the override up.
+        Backend other;
+        QCOMPARE(other.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+E")}));
+
+        QVERIFY(!backend.setShortcut(QStringLiteral("toggle-sidebar"), QString()));
+        QVERIFY(!backend.setShortcut(QStringLiteral("no-such-action"), QStringLiteral("Ctrl+E")));
+        QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+E")}));
+
+        backend.resetShortcut(QStringLiteral("toggle-sidebar"));
+        QCOMPARE(backend.shortcutSequences(QStringLiteral("toggle-sidebar")),
+                 (QStringList{QStringLiteral("Ctrl+O")}));
+    }
+
+    void scrollSpeedDefaultsToDoubleAndPersists() {
+        Backend backend;
+        const double original = backend.scrollSpeed();
+        QCOMPARE(original, 2.0);
+
+        backend.setScrollSpeed(1.5);
+        QCOMPARE(backend.scrollSpeed(), 1.5);
+        Backend other;
+        QCOMPARE(other.scrollSpeed(), 1.5);
+
+        // Out-of-range values clamp instead of sticking.
+        backend.setScrollSpeed(99.0);
+        QCOMPARE(backend.scrollSpeed(), 4.0);
+        backend.setScrollSpeed(0.0);
+        QCOMPARE(backend.scrollSpeed(), 0.25);
+
+        backend.setScrollSpeed(original);
+        QCOMPARE(Backend().scrollSpeed(), original);
     }
 
 private:

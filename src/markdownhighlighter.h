@@ -5,6 +5,8 @@
 #include <QTextCharFormat>
 #include <QTextCursor>
 
+class QFont;
+
 class MarkdownHighlighter : public QSyntaxHighlighter {
     Q_OBJECT
 
@@ -22,7 +24,7 @@ public:
         int length;
     };
 
-    enum class InlineKind { Bold, Italic, Strikethrough, Link };
+    enum class InlineKind { Bold, Italic, Strikethrough, Link, WikiLink };
 
     // Carried from block to block so a fenced run of code knows it is inside
     // one. Stored on the block, which is where Backend reads it.
@@ -38,11 +40,40 @@ public:
         Span destination{};
     };
 
+    // A GitHub-style task marker, "[ ]" or "[x]", after a list marker.
+    struct TaskMarker {
+        int start = -1;
+        int length = 0;
+        bool checked = false;
+        bool isValid() const { return start >= 0; }
+    };
+
     // Single source of truth for inline markdown spans: the highlighter uses it
     // to style content and hide markers, and Backend to find what the caret
     // sits in.
     static QList<InlineMarkup> inlineMarkup(const QString &text);
     static QString linkUrlAt(const QString &text, int position);
+    static QString wikiLinkTargetAt(const QString &text, int position);
+    static TaskMarker taskMarker(const QString &text);
+
+    // A line that holds nothing but one image embed: Obsidian's
+    // ![[image.png]] or ![[image.png|300]], or Markdown's ![alt](path).
+    // Such a line is shown as the image itself while the caret is elsewhere.
+    struct ImageEmbed {
+        int start = -1;
+        int length = 0;
+        QString target;
+        bool wiki = false;
+        // A display width asked for with ![[image.png|300]], or 0.
+        int width = 0;
+        bool isValid() const { return start >= 0; }
+    };
+    static ImageEmbed imageEmbed(const QString &text);
+    static bool isImageFileName(const QString &name);
+
+    // The width a hidden task marker reserves for its drawn checkbox, so the
+    // highlighter and the editor's hanging indents measure it alike.
+    static qreal taskCheckboxWidth(const QFont &font);
 
     // Inline code spans, backticks included.
     static QList<Span> codeSpans(const QString &text);
@@ -75,6 +106,8 @@ private:
     QString m_customCodeBackground;
     QTextCharFormat m_markerFormat;
     QTextCharFormat m_hiddenMarkerFormat;
+    // Hides a task marker while reserving the width of its drawn checkbox.
+    QTextCharFormat m_taskMarkerFormat;
     QTextCharFormat m_headingFormat;
     QTextCharFormat m_boldFormat;
     QTextCharFormat m_italicFormat;

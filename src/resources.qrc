@@ -8,6 +8,10 @@
         <file alias="UnsavedChangesDialog.qml">UnsavedChangesDialog.qml</file>
         <file alias="ExternalChangeDialog.qml">ExternalChangeDialog.qml</file>
         <file alias="FontPicker.qml">FontPicker.qml</file>
+        <file alias="ImageViewer.qml">ImageViewer.qml</file>
+        <file alias="ImageViewerButton.qml">ImageViewerButton.qml</file>
+        <file alias="TreeHeaderButton.qml">TreeHeaderButton.qml</file>
+        <file alias="SettingsDialog.qml">SettingsDialog.qml</file>
         <file alias="EditorMutations.js">EditorMutations.js</file>
         <file alias="fonts/IBMPlexMono-Regular.ttf">../fonts/IBMPlexMono-Regular.ttf</file>
         <file alias="fonts/IBMPlexMono-Italic.ttf">../fonts/IBMPlexMono-Italic.ttf</file>

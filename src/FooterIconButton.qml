@@ -60,6 +60,20 @@ Item {
                 context.lineTo(13, 13.5);
                 context.moveTo(5, 9.5);
                 context.lineTo(11, 9.5);
+            } else if (control.iconName === "search") {
+                context.arc(7, 6.5, 3.5, 0, Math.PI * 2);
+                context.moveTo(9.5, 9);
+                context.lineTo(13, 12.5);
+            } else if (control.iconName === "settings") {
+                // A gear: outer ring, eight spokes, and a hub.
+                context.arc(8, 8, 3.2, 0, Math.PI * 2);
+                context.moveTo(8, 8);
+                context.arc(8, 8, 1.1, 0, Math.PI * 2);
+                for (var spoke = 0; spoke < 8; ++spoke) {
+                    var angle = spoke * Math.PI / 4 + Math.PI / 8;
+                    context.moveTo(8 + Math.cos(angle) * 4.2, 8 + Math.sin(angle) * 4.2);
+                    context.lineTo(8 + Math.cos(angle) * 5.8, 8 + Math.sin(angle) * 5.8);
+                }
             } else {
                 context.moveTo(2.5, 13);
                 context.lineTo(2.5, 3.5);

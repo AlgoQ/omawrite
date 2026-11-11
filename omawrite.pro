@@ -18,3 +18,7 @@ SOURCES += \
     src/systemtheme.cpp
 
 RESOURCES += src/resources.qrc
+
+# Where `omawrite --update` rebuilds from: the makepkg build runs in this
+# checkout, so the installed binary always knows its own source.
+DEFINES += OMAWRITE_SOURCE_DIR=\\\"$$PWD\\\"

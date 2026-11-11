@@ -1,15 +1,24 @@
 #include "backend.h"
 
+#include <QBuffer>
 #include <QClipboard>
+#include <QDateTime>
+#include <QImage>
+#include <QImageReader>
 #include <QtConcurrent/QtConcurrentRun>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
+#include <QDesktopServices>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
 #include <QFontDatabase>
+#include <QFontMetricsF>
 #include <QGuiApplication>
+#include <QHash>
+#include <QKeySequence>
 #include <QMimeData>
 #include <QProcess>
 #include <QPrintDialog>
@@ -17,6 +26,7 @@
 #include <QQuickTextDocument>
 #include <QRegularExpression>
 #include <QScreen>
+#include <QSet>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QJsonDocument>
@@ -34,7 +44,9 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
+#include <vector>
 
 #include "markdownhighlighter.h"
 
@@ -43,6 +55,57 @@ constexpr qreal typoraLineHeightPercent = 140;
 static QTextBlockFormat lineHeightFormat() {
     QTextBlockFormat format;
     format.setLineHeight(typoraLineHeightPercent, QTextBlockFormat::ProportionalHeight);
+    return format;
+}
+
+// A list item's wrapped lines belong under its text, not under the marker or
+// the page margin. Qt's block indent moves every line, and a matching negative
+// first-line indent puts the marker itself back where it was.
+static QTextBlockFormat hangingIndentFormat(const QString &text, const QFontMetricsF &metrics,
+                                            const QFont &font) {
+    QTextBlockFormat format;
+    static const QRegularExpression listItemRe(
+        QStringLiteral("^([ \\t]*(?:[-+*]|\\d+[.)])[ \\t]+)"));
+    const QRegularExpressionMatch match = listItemRe.match(text);
+    if (!match.hasMatch() || MarkdownHighlighter::isThematicBreak(text)) {
+        // Explicit zeros clear an indent left by a line that used to be an item.
+        format.setIndent(0);
+        format.setTextIndent(0);
+        return format;
+    }
+
+    QString prefix = match.captured(1);
+    // Measure tabs as the four-column stops the editor draws them at.
+    QString measured;
+    int column = 0;
+    for (const QChar character : prefix) {
+        if (character == QLatin1Char('\t')) {
+            const int spaces = 4 - column % 4;
+            measured.append(QString(spaces, QLatin1Char(' ')));
+            column += spaces;
+        } else {
+            measured.append(character);
+            ++column;
+        }
+    }
+
+    qreal indent = metrics.horizontalAdvance(measured);
+
+    // A task's checkbox replaces "[ ]" with the width it is drawn at. The
+    // whitespace after it stays, so measure that too and wrapped lines start
+    // under the task text rather than under the checkbox.
+    const MarkdownHighlighter::TaskMarker task = MarkdownHighlighter::taskMarker(text);
+    if (task.isValid()) {
+        int contentStart = task.start + task.length;
+        while (contentStart < text.length() && text.at(contentStart).isSpace())
+            ++contentStart;
+        indent += MarkdownHighlighter::taskCheckboxWidth(font)
+            + metrics.horizontalAdvance(text.mid(task.start + task.length,
+                                                 contentStart - task.start - task.length));
+    }
+
+    format.setIndent(qRound(indent));
+    format.setTextIndent(-indent);
     return format;
 }
 const QString lastSaveDirectorySetting = QStringLiteral("file/lastSaveDirectory");
@@ -54,6 +117,70 @@ constexpr qreal textZoomSteps[] = {0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.
 constexpr int textZoomStepCount = int(std::size(textZoomSteps));
 
 const QString editorFontSetting = QStringLiteral("editor/font");
+const QString scrollSpeedSetting = QStringLiteral("scroll/speed");
+const QString treeModeSetting = QStringLiteral("fileTree/mode");
+
+// Wheel-scroll multiplier and tree source, shared by the editor Flickable and
+// the file viewer's list. Twice as fast as the toolkit default reads better
+// next to the eased Chromium-style scrolling, so 2.0 is the default.
+constexpr double defaultScrollSpeed = 2.0;
+constexpr double minScrollSpeed = 0.25;
+constexpr double maxScrollSpeed = 4.0;
+
+// Every rebindable action: the id QML binds to, the label the dialogs show,
+// and the sequences a fresh settings file behaves as. The settings dialog and
+// the shortcuts reference both read this table, so it is the only place that
+// names a default key.
+struct ShortcutDef {
+    const char *id;
+    const char *description;
+    // A vector, not an initializer_list: the list's backing array would be a
+    // temporary, dangling once this static table is built.
+    std::vector<const char *> defaults;
+};
+
+static const QList<ShortcutDef> shortcutDefs = {
+    {"save", "Save", {"Ctrl+S"}},
+    {"save-as", "Save As", {"Ctrl+Shift+S"}},
+    {"toggle-sidebar", "File Viewer (Show / Hide)", {"Ctrl+O"}},
+    {"quick-open", "Open Other File", {"Ctrl+Shift+O"}},
+    {"tab-1", "Go to Tab 1", {"Ctrl+1"}},
+    {"tab-2", "Go to Tab 2", {"Ctrl+2"}},
+    {"tab-3", "Go to Tab 3", {"Ctrl+3"}},
+    {"tab-4", "Go to Tab 4", {"Ctrl+4"}},
+    {"tab-5", "Go to Tab 5", {"Ctrl+5"}},
+    {"tab-6", "Go to Tab 6", {"Ctrl+6"}},
+    {"tab-7", "Go to Tab 7", {"Ctrl+7"}},
+    {"tab-8", "Go to Tab 8", {"Ctrl+8"}},
+    {"tab-9", "Go to Tab 9 (Last)", {"Ctrl+9"}},
+    {"next-tab", "Next Tab", {"Ctrl+Tab"}},
+    {"prev-tab", "Previous Tab", {"Ctrl+Shift+Tab"}},
+    {"close-tab", "Close Tab", {"Ctrl+W"}},
+    {"backlinks", "Linked Mentions (Backlinks)", {"Ctrl+Shift+B"}},
+    {"new-window", "New Window", {"Ctrl+N"}},
+    {"print", "Print", {"Ctrl+P"}},
+    {"copy-html", "Copy as HTML", {"Ctrl+Shift+C"}},
+    {"fullscreen", "Fullscreen", {"Meta+F", "F11"}},
+    {"undo", "Undo", {"Ctrl+Z"}},
+    {"redo", "Redo", {"Ctrl+Shift+Z", "Ctrl+Y"}},
+    {"find", "Find", {"Ctrl+F"}},
+    {"find-replace", "Find & Replace", {"Ctrl+H"}},
+    {"find-next", "Next Match in Find", {"Ctrl+G"}},
+    {"bold", "Bold", {"Ctrl+B"}},
+    {"italic", "Italic", {"Ctrl+I"}},
+    {"strikethrough", "Strikethrough", {"Ctrl+Shift+X"}},
+    {"insert-link", "Insert Link", {"Ctrl+K"}},
+    {"follow-link", "Follow Link", {"Ctrl+Return", "Ctrl+Enter"}},
+    {"toggle-task", "Toggle Checkbox", {"Ctrl+Shift+Return", "Ctrl+Shift+Enter"}},
+    {"zoom-in", "Increase Text Size", {"Ctrl+=", "Ctrl++"}},
+    {"zoom-out", "Decrease Text Size", {"Ctrl+-"}},
+    {"zoom-reset", "Reset Text Size", {"Ctrl+0"}},
+    {"shortcuts-dialog", "Shortcuts", {"Ctrl+?", "Ctrl+/", "F1"}},
+};
+
+static QString shortcutSettingsKey(const QString &id) {
+    return QStringLiteral("shortcuts/") + id;
+}
 
 // Noto ships a separate family per script, which buries every other font in
 // the picker. Offer only the core Latin families; the rest still serve as
@@ -134,6 +261,16 @@ Backend::Backend(QObject *parent) : QObject(parent) {
         ? savedFont
         : defaultEditorFont();
 
+    bool speedOk = false;
+    const double storedSpeed = QSettings().value(scrollSpeedSetting, defaultScrollSpeed)
+                                   .toDouble(&speedOk);
+    m_scrollSpeed = speedOk && storedSpeed > 0
+        ? qBound(minScrollSpeed, storedSpeed, maxScrollSpeed)
+        : defaultScrollSpeed;
+
+    const QString storedMode = QSettings().value(treeModeSetting, QStringLiteral("links")).toString();
+    m_treeMode = storedMode == QStringLiteral("folders") ? storedMode : QStringLiteral("links");
+
     const QString stateDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(stateDirectory);
     // Claim an orphaned snapshot before taking an empty slot. This ensures a
@@ -202,6 +339,14 @@ void Backend::setParentWindow(QWindow *window) {
     m_parentWindow = window;
 }
 
+QUrl Backend::documentFolder() const {
+    if (m_fileUrl.isLocalFile())
+        return QUrl::fromLocalFile(QFileInfo(m_fileUrl.toLocalFile()).absolutePath());
+
+    const QString lastFolder = QSettings().value(lastSaveDirectorySetting).toString();
+    return lastFolder.isEmpty() ? QUrl() : QUrl::fromLocalFile(lastFolder);
+}
+
 QString Backend::fileName() const {
     if (!m_fileUrl.isValid() || m_fileUrl.isEmpty())
         return QStringLiteral("Untitled.md");
@@ -265,6 +410,126 @@ void Backend::setTextZoom(qreal zoom) {
     emit textScaleChanged();
 }
 
+void Backend::setScrollSpeed(double speed) {
+    // A wheel that barely moves, or one that jumps pages, is a misconfiguration
+    // rather than a preference, so clamp instead of refusing.
+    const double clamped = qBound(minScrollSpeed, speed, maxScrollSpeed);
+    if (qFuzzyCompare(m_scrollSpeed, clamped))
+        return;
+
+    m_scrollSpeed = clamped;
+    QSettings().setValue(scrollSpeedSetting, clamped);
+    emit scrollSpeedChanged();
+}
+
+void Backend::setTreeMode(const QString &mode) {
+    const QString cleaned = mode == QStringLiteral("folders") ? mode : QStringLiteral("links");
+    if (m_treeMode == cleaned)
+        return;
+
+    m_treeMode = cleaned;
+    QSettings().setValue(treeModeSetting, cleaned);
+    emit treeModeChanged();
+}
+
+QStringList Backend::shortcutIds() const {
+    QStringList ids;
+    for (const ShortcutDef &def : shortcutDefs)
+        ids.append(QString::fromLatin1(def.id));
+    return ids;
+}
+
+QString Backend::shortcutDescription(const QString &id) const {
+    for (const ShortcutDef &def : shortcutDefs) {
+        if (id == QString::fromLatin1(def.id))
+            return QString::fromLatin1(def.description);
+    }
+    return {};
+}
+
+QStringList Backend::shortcutDefaults(const QString &id) const {
+    for (const ShortcutDef &def : shortcutDefs) {
+        if (id != QString::fromLatin1(def.id))
+            continue;
+        QStringList defaults;
+        for (const char *sequence : def.defaults)
+            defaults.append(QString::fromLatin1(sequence));
+        return defaults;
+    }
+    return {};
+}
+
+QStringList Backend::shortcutSequences(const QString &id) const {
+    if (shortcutDefaults(id).isEmpty())
+        return {};
+    const QStringList stored = QSettings().value(shortcutSettingsKey(id)).toStringList();
+    if (stored.isEmpty())
+        return shortcutDefaults(id);
+    // An override edited by hand outside the settings dialog must not leave a
+    // dead key: anything unparseable falls back to the defaults wholesale.
+    for (const QString &sequence : stored) {
+        if (QKeySequence(sequence).isEmpty())
+            return shortcutDefaults(id);
+    }
+    return stored;
+}
+
+bool Backend::setShortcut(const QString &id, const QString &text) {
+    if (shortcutDefaults(id).isEmpty())
+        return false;
+    // Commas separate alternates ("Ctrl+Shift+Z, Ctrl+Y"); a single empty or
+    // unparseable entry rejects the whole override, so half a key never sticks.
+    QStringList sequences;
+    for (const QString &part : text.split(QLatin1Char(','))) {
+        const QString sequence = part.trimmed();
+        if (sequence.isEmpty() || QKeySequence(sequence).isEmpty())
+            return false;
+        sequences.append(QKeySequence(sequence).toString(QKeySequence::PortableText));
+    }
+    if (sequences.isEmpty())
+        return false;
+    QSettings().setValue(shortcutSettingsKey(id), sequences);
+    emit shortcutsChanged();
+    return true;
+}
+
+void Backend::resetShortcut(const QString &id) {
+    if (shortcutDefaults(id).isEmpty())
+        return;
+    QSettings().remove(shortcutSettingsKey(id));
+    emit shortcutsChanged();
+}
+
+void Backend::resetAllShortcuts() {
+    for (const ShortcutDef &def : shortcutDefs)
+        QSettings().remove(shortcutSettingsKey(QString::fromLatin1(def.id)));
+    emit shortcutsChanged();
+}
+
+QVariantList Backend::shortcutRows() const {
+    QVariantList rows;
+    for (const ShortcutDef &def : shortcutDefs) {
+        const QString id = QString::fromLatin1(def.id);
+        const QStringList sequences = shortcutSequences(id);
+        rows.append(QVariantMap{
+            {QStringLiteral("id"), id},
+            {QStringLiteral("description"), QString::fromLatin1(def.description)},
+            {QStringLiteral("sequence"), sequences.join(QStringLiteral(", "))},
+            {QStringLiteral("isDefault"),
+             sequences == shortcutDefaults(id)}});
+    }
+    return rows;
+}
+
+QVariantMap Backend::shortcutMap() const {
+    QVariantMap map;
+    for (const ShortcutDef &def : shortcutDefs) {
+        const QString id = QString::fromLatin1(def.id);
+        map.insert(id, shortcutSequences(id));
+    }
+    return map;
+}
+
 void Backend::attachDocument(QObject *textDocument) {
     auto *quickDocument = qobject_cast<QQuickTextDocument *>(textDocument);
     if (!quickDocument || !quickDocument->textDocument()) {
@@ -317,11 +582,13 @@ void Backend::open(const QUrl &url) {
     file.setTextModeEnabled(true);
     file.seek(0);
     const QByteArray contents = file.readAll();
+    // Before the text is laid out: image embeds resolve against the document's
+    // folder, and laying out text without it would find none of them.
+    setFileUrl(url);
     loadDocumentText(QString::fromUtf8(contents));
     clearRecovery();
     setKnownFileContents(contents, true);
     m_autoSaveSuspended = false;
-    setFileUrl(url);
     watchCurrentFile();
     setModified(false);
     if (savesUnchanged(raw)) {
@@ -380,12 +647,12 @@ void Backend::openOrStartFile(const QUrl &requestedUrl) {
         return;
     }
 
+    setFileUrl(url);
     loadDocumentText(QString());
     clearRecovery();
     // Nothing has been read, so no text counts as saved, and auto-save holds
     // off until an explicit save creates the file (see autoSave()).
     setKnownFileContents(QByteArray(), false);
-    setFileUrl(url);
     watchCurrentFile();
     setModified(false);
     setStatus(QStringLiteral("New file %1").arg(fileName()));
@@ -466,11 +733,12 @@ void Backend::copyAsHtml() {
     rendered.setMarkdown(currentDocumentText());
 
     // Drop Qt's fixed fonts and margins from the body and blocks, so the pasted
-    // text takes on the destination's own typeface and paragraph spacing.
+    // text takes on the destination's own typeface and paragraph spacing. A
+    // task list's <li> carries a class before its style, which stays.
     QString html = rendered.toHtml();
     static const QRegularExpression blockStyle(
-        QStringLiteral("<(body|p|h[1-6]|ul|ol|li)\\s+style=\"[^\"]*\""));
-    html.replace(blockStyle, QStringLiteral("<\\1"));
+        QStringLiteral("<(body|p|h[1-6]|ul|ol|li)(\\s+[^>]*?)?\\s+style=\"[^\"]*\""));
+    html.replace(blockStyle, QStringLiteral("<\\1\\2"));
 
     auto *mimeData = new QMimeData;
     mimeData->setHtml(html);
@@ -619,6 +887,1004 @@ QString Backend::linkUrlAt(int position) const {
         return {};
 
     return MarkdownHighlighter::linkUrlAt(block.text(), position - block.position());
+}
+
+// Every task item's marker, in document order, for the editor's checkboxes.
+QVariantList Backend::taskMarkers() const {
+    QVariantList markers;
+    if (!m_document)
+        return markers;
+
+    for (QTextBlock block = m_document->begin(); block.isValid(); block = block.next()) {
+        if (block.userState() >= MarkdownHighlighter::InsideFence)
+            continue;
+        const MarkdownHighlighter::TaskMarker task =
+            MarkdownHighlighter::taskMarker(block.text());
+        if (!task.isValid())
+            continue;
+        markers.append(QVariantMap{{QStringLiteral("position"), block.position() + task.start},
+                                   {QStringLiteral("checked"), task.checked}});
+    }
+    return markers;
+}
+
+// Toggles the checkbox on the line at position. The replacement is one edit,
+// so a single undo puts the checkbox back.
+bool Backend::toggleTaskAt(int position) {
+    if (!m_document)
+        return false;
+
+    const QTextBlock block =
+        m_document->findBlock(qBound(0, position, m_document->characterCount() - 1));
+    if (!block.isValid() || block.userState() >= MarkdownHighlighter::InsideFence)
+        return false;
+
+    const MarkdownHighlighter::TaskMarker task = MarkdownHighlighter::taskMarker(block.text());
+    if (!task.isValid())
+        return false;
+
+    replaceRange(block.position() + task.start + 1,
+                 block.position() + task.start + 2,
+                 task.checked ? QStringLiteral(" ") : QStringLiteral("x"));
+    return true;
+}
+
+void Backend::openExternalUrl(const QString &url) {
+    const QUrl target = QUrl::fromUserInput(url.trimmed());
+    const QString scheme = target.scheme().toLower();
+    if (scheme != QStringLiteral("http") && scheme != QStringLiteral("https")
+            && scheme != QStringLiteral("mailto")) {
+        setStatus(QStringLiteral("Cannot open %1").arg(url));
+        return;
+    }
+    if (!QDesktopServices::openUrl(target))
+        setStatus(QStringLiteral("Could not open %1").arg(url));
+}
+
+// The note's folder, or the nearest folder above it that holds an Obsidian
+// vault marker. A slipbox is often nested (ai/, drawings/), and [[links]]
+// resolve across the whole vault, not just beside the current file.
+QString Backend::notesRoot() const {
+    QString start;
+    if (m_fileUrl.isLocalFile())
+        start = QFileInfo(m_fileUrl.toLocalFile()).absolutePath();
+    else
+        start = QSettings().value(lastSaveDirectorySetting).toString();
+    if (start.isEmpty())
+        return {};
+
+    QDir directory(start);
+    while (true) {
+        if (QDir(directory.filePath(QStringLiteral(".obsidian"))).exists())
+            return directory.absolutePath();
+        if (!directory.cdUp())
+            break;
+    }
+    return QDir(start).absolutePath();
+}
+
+void Backend::refreshNoteIndex() {
+    m_notesRoot = notesRoot();
+    m_notePaths.clear();
+    m_noteMeta.clear();
+    m_notesIndexed = true;
+    if (m_notesRoot.isEmpty())
+        return;
+
+    const QDir root(m_notesRoot);
+    QDirIterator iterator(m_notesRoot, {QStringLiteral("*.md"), QStringLiteral("*.markdown")},
+                          QDir::Files, QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        const QString relative = root.relativeFilePath(iterator.next());
+        // Obsidian keeps its settings and trash in dot folders; neither holds
+        // notes the writer means to link to.
+        if (relative.startsWith(QLatin1Char('.'))
+                || relative.contains(QStringLiteral("/.")))
+            continue;
+
+        m_notePaths.append(relative);
+    }
+
+    std::sort(m_notePaths.begin(), m_notePaths.end(), [](const QString &a, const QString &b) {
+        const QString aName = QFileInfo(a).completeBaseName();
+        const QString bName = QFileInfo(b).completeBaseName();
+        const int byName = aName.compare(bName, Qt::CaseInsensitive);
+        return byName != 0 ? byName < 0 : a.compare(b, Qt::CaseInsensitive) < 0;
+    });
+
+    // One head read per note, so the link tree and future panels never scan
+    // the vault again for what the index already knows.
+    for (const QString &path : m_notePaths)
+        m_noteMeta.insert(path, readNoteFrontmatter(root.filePath(path)));
+}
+
+QVariantList Backend::noteSuggestions(const QString &query) {
+    if (!m_notesIndexed || m_notesRoot != notesRoot())
+        refreshNoteIndex();
+
+    QHash<QString, int> nameCounts;
+    for (const QString &path : m_notePaths)
+        ++nameCounts[QFileInfo(path).completeBaseName().toCaseFolded()];
+
+    const QString needle = query.trimmed().toCaseFolded();
+    struct Suggestion {
+        QString path;
+        QString name;
+        QString insert;
+        int score;
+    };
+    QList<Suggestion> matches;
+    for (const QString &path : m_notePaths) {
+        const QString name = QFileInfo(path).completeBaseName();
+        int score = 0;
+        if (!needle.isEmpty()) {
+            const int nameAt = name.toCaseFolded().indexOf(needle);
+            const int pathAt = path.toCaseFolded().indexOf(needle);
+            if (nameAt < 0 && pathAt < 0)
+                continue;
+            score = nameAt >= 0 ? nameAt : 1000 + pathAt;
+        }
+        QString stem = path;
+        const int slash = stem.lastIndexOf(QLatin1Char('/'));
+        const int dot = stem.lastIndexOf(QLatin1Char('.'));
+        if (dot > slash)
+            stem.truncate(dot);
+        const bool duplicate = nameCounts.value(name.toCaseFolded()) > 1;
+        const QString insert = duplicate && stem.contains(QLatin1Char('/')) ? stem : name;
+        matches.append({path, name, insert, score});
+    }
+
+    std::sort(matches.begin(), matches.end(), [](const Suggestion &a, const Suggestion &b) {
+        if (a.score != b.score)
+            return a.score < b.score;
+        const int byName = a.name.compare(b.name, Qt::CaseInsensitive);
+        return byName != 0 ? byName < 0 : a.path.compare(b.path, Qt::CaseInsensitive) < 0;
+    });
+
+    QVariantList suggestions;
+    const int limit = 50;
+    for (int i = 0; i < matches.size() && i < limit; ++i) {
+        suggestions.append(QVariantMap{
+            {QStringLiteral("name"), matches[i].name},
+            {QStringLiteral("path"), matches[i].path},
+            {QStringLiteral("insert"), matches[i].insert},
+            {QStringLiteral("url"),
+             QUrl::fromLocalFile(QDir(m_notesRoot).filePath(matches[i].path))}});
+    }
+    return suggestions;
+}
+
+// A frontmatter value with its quotes dropped. For up: links the brackets,
+// aliases, and headings come off too, leaving the bare note target.
+static QString cleanFrontmatterValue(QString value, bool link) {
+    value = value.trimmed();
+    if (value.size() >= 2
+            && ((value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"')))
+                || (value.startsWith(QLatin1Char('\'')) && value.endsWith(QLatin1Char('\'')))))
+        value = value.mid(1, value.size() - 2).trimmed();
+    if (!link)
+        return value;
+    if (value.startsWith(QStringLiteral("[["))) {
+        const int close = value.indexOf(QStringLiteral("]]"));
+        if (close > 2)
+            value = value.mid(2, close - 2);
+    }
+    const int alias = value.indexOf(QLatin1Char('|'));
+    if (alias >= 0)
+        value.truncate(alias);
+    const int heading = value.indexOf(QLatin1Char('#'));
+    if (heading >= 0)
+        value.truncate(heading);
+    return value.trimmed();
+}
+
+// The top-level up: and tags:/tag: keys of a note's frontmatter. Only the
+// head of the file is read: the block always opens the note, and a vault-wide
+// index cannot afford whole files. A mapping under up: (an object, not
+// parents) is left alone rather than guessed at.
+Backend::NoteMeta Backend::readNoteFrontmatter(const QString &absolutePath) {
+    NoteMeta meta;
+    QFile file(absolutePath);
+    if (!file.open(QIODevice::ReadOnly))
+        return meta;
+    const QList<QByteArray> lines = file.read(4096).split('\n');
+    if (lines.isEmpty() || lines.constFirst().trimmed() != "---")
+        return meta;
+    int end = -1;
+    for (int i = 1; i < lines.size(); ++i) {
+        const QByteArray trimmed = lines.at(i).trimmed();
+        if (trimmed == "---" || trimmed == "...") {
+            end = i;
+            break;
+        }
+    }
+    if (end < 0)
+        return meta;
+
+    for (int i = 1; i < end;) {
+        const QString line = QString::fromUtf8(lines.at(i));
+        if (line.isEmpty() || line.at(0).isSpace() || !line.contains(QLatin1Char(':'))) {
+            ++i;
+            continue;
+        }
+        const QString key = line.left(line.indexOf(QLatin1Char(':'))).trimmed();
+        const bool isUp = key == QStringLiteral("up");
+        if (!isUp && key != QStringLiteral("tags") && key != QStringLiteral("tag")) {
+            ++i;
+            continue;
+        }
+        const QString rest = line.mid(line.indexOf(QLatin1Char(':')) + 1).trimmed();
+        QStringList *out = isUp ? &meta.ups : &meta.tags;
+        if (rest.isEmpty()) {
+            // A block list: the indented "- item" lines that follow the key.
+            // Anything else (a nested mapping's "key: value") ends it.
+            ++i;
+            while (i < end) {
+                const QString item = QString::fromUtf8(lines.at(i)).trimmed();
+                if (!item.startsWith(QLatin1Char('-')))
+                    break;
+                const QString value = cleanFrontmatterValue(item.mid(1), isUp);
+                if (!value.isEmpty())
+                    out->append(value);
+                ++i;
+            }
+            continue;
+        }
+        if (isUp && rest.startsWith(QLatin1Char('{'))) {
+            ++i;
+            continue;
+        }
+        if (rest.startsWith(QLatin1Char('['))) {
+            QString flow = rest.mid(1);
+            if (flow.endsWith(QLatin1Char(']')))
+                flow.chop(1);
+            for (const QString &part : flow.split(QLatin1Char(','))) {
+                const QString value = cleanFrontmatterValue(part, isUp);
+                if (!value.isEmpty())
+                    out->append(value);
+            }
+            ++i;
+            continue;
+        }
+        const QString value = cleanFrontmatterValue(rest, isUp);
+        if (!value.isEmpty())
+            out->append(value);
+        ++i;
+    }
+    return meta;
+}
+
+QVariantMap Backend::noteFrontmatter(const QString &relativePath) {
+    if (!m_notesIndexed || m_notesRoot != notesRoot())
+        refreshNoteIndex();
+    const NoteMeta meta = m_noteMeta.value(relativePath);
+    return QVariantMap{{QStringLiteral("ups"), meta.ups}, {QStringLiteral("tags"), meta.tags}};
+}
+
+// Where an up: target points, as an index-relative path. Beside the source
+// note wins, then the vault root, then a name unique across the vault — the
+// same order [[ links resolve in — so the tree nests notes where following
+// their links would land.
+QString Backend::resolveUpTarget(const QString &target, const QString &sourceDir) const {
+    QString name = target.trimmed();
+    if (name.isEmpty())
+        return {};
+
+    const int heading = name.indexOf(QLatin1Char('#'));
+    if (heading >= 0)
+        name.truncate(heading);
+    name = name.trimmed();
+    if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
+        name.chop(9);
+    else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
+        name.chop(3);
+    if (name.isEmpty() || name.contains(QStringLiteral(".."))
+            || QDir::isAbsolutePath(name))
+        return {};
+
+    const QDir root(m_notesRoot);
+    const QStringList suffixes{QStringLiteral(".md"), QStringLiteral(".markdown")};
+    for (const QString &suffix : suffixes) {
+        const QFileInfo beside(QDir(sourceDir).filePath(name + suffix));
+        if (!beside.isFile())
+            continue;
+        const QString relative = root.relativeFilePath(beside.canonicalFilePath());
+        if (!relative.startsWith(QStringLiteral("..")))
+            return relative;
+    }
+    for (const QString &suffix : suffixes) {
+        const QFileInfo atRoot(root.filePath(name + suffix));
+        if (atRoot.isFile())
+            return root.relativeFilePath(atRoot.canonicalFilePath());
+    }
+
+    const QString wanted = QFileInfo(name).fileName();
+    QString match;
+    for (const QString &path : m_notePaths) {
+        if (QFileInfo(path).completeBaseName().compare(wanted, Qt::CaseInsensitive) != 0)
+            continue;
+        // Two notes sharing a bare name leave the parent unresolved instead
+        // of nesting under the wrong one.
+        if (!match.isEmpty() && match != path)
+            return {};
+        match = path;
+    }
+    return match;
+}
+
+// Generated exports, not knowledge notes: they bulk up the hierarchy without
+// ever being linked as parents.
+static bool excludedFromVirtTree(const QString &relativePath) {
+    return relativePath == QStringLiteral("drawings")
+        || relativePath.startsWith(QStringLiteral("drawings/"));
+}
+
+QVariantList Backend::virtFolderTree() {
+    if (!m_notesIndexed || m_notesRoot != notesRoot())
+        refreshNoteIndex();
+    QVariantList tree;
+    if (m_notesRoot.isEmpty())
+        return tree;
+
+    const QDir root(m_notesRoot);
+    const auto byName = [](const QString &a, const QString &b) {
+        const int name = QFileInfo(a).completeBaseName().compare(
+            QFileInfo(b).completeBaseName(), Qt::CaseInsensitive);
+        return name != 0 ? name < 0 : a.compare(b, Qt::CaseInsensitive) < 0;
+    };
+
+    QHash<QString, QStringList> childrenOf;
+    QSet<QString> hasParent;
+    for (const QString &path : m_notePaths) {
+        if (excludedFromVirtTree(path))
+            continue;
+        const QString sourceDir = root.filePath(QFileInfo(path).path());
+        for (const QString &up : m_noteMeta.value(path).ups) {
+            const QString parent = resolveUpTarget(up, sourceDir);
+            if (parent.isEmpty() || parent == path || excludedFromVirtTree(parent))
+                continue;
+            if (!childrenOf[parent].contains(path))
+                childrenOf[parent].append(path);
+            hasParent.insert(path);
+        }
+    }
+    for (auto it = childrenOf.begin(); it != childrenOf.end(); ++it)
+        std::sort(it.value().begin(), it.value().end(), byName);
+
+    const std::function<QVariantMap(const QString &, const QSet<QString> &)> build =
+        [&](const QString &path, const QSet<QString> &ancestors) {
+            QVariantList kids;
+            QSet<QString> next = ancestors;
+            next.insert(path);
+            for (const QString &child : childrenOf.value(path)) {
+                // A link cycle rejoins an ancestor: show the note once, where
+                // it is first reached, rather than recursing forever.
+                if (next.contains(child))
+                    continue;
+                kids.append(build(child, next));
+            }
+            return QVariantMap{
+                {QStringLiteral("name"), QFileInfo(path).completeBaseName()},
+                {QStringLiteral("path"), path},
+                {QStringLiteral("url"), QUrl::fromLocalFile(root.filePath(path))},
+                {QStringLiteral("tags"), m_noteMeta.value(path).tags},
+                {QStringLiteral("childCount"), childrenOf.value(path).size()},
+                {QStringLiteral("children"), kids}};
+        };
+
+    // A note whose parents resolve nests under each of them; anything without
+    // one — orphans included — stays a root, like VirtFolder shows them.
+    QStringList roots;
+    for (const QString &path : m_notePaths) {
+        if (!excludedFromVirtTree(path) && !hasParent.contains(path))
+            roots.append(path);
+    }
+    std::sort(roots.begin(), roots.end(), byName);
+
+    QSet<QString> placed;
+    const std::function<void(const QVariantList &)> markPlaced = [&](const QVariantList &rows) {
+        for (const QVariant &row : rows) {
+            placed.insert(row.toMap().value(QStringLiteral("path")).toString());
+            markPlaced(row.toMap().value(QStringLiteral("children")).toList());
+        }
+    };
+    for (const QString &path : roots) {
+        if (placed.contains(path))
+            continue;
+        tree.append(build(path, QSet<QString>()));
+        markPlaced(tree.constLast().toMap().value(QStringLiteral("children")).toList());
+        placed.insert(path);
+    }
+    // A pure cycle has no roots at all; lift its members up so no note hides.
+    for (const QString &path : m_notePaths) {
+        if (!excludedFromVirtTree(path) && !placed.contains(path)) {
+            tree.append(build(path, QSet<QString>()));
+            markPlaced(tree.constLast().toMap().value(QStringLiteral("children")).toList());
+            placed.insert(path);
+        }
+    }
+    return tree;
+}
+
+QString Backend::fileTreeRoot() const {
+    const QString root = notesRoot();
+    return root.isEmpty() ? QDir::homePath() : root;
+}
+
+QVariantList Backend::listFolder(const QString &relativePath) const {
+    if (relativePath.contains(QStringLiteral("..")) || QDir::isAbsolutePath(relativePath))
+        return {};
+
+    const QDir root(fileTreeRoot());
+    const QDir folder(relativePath.isEmpty() ? root.path() : root.filePath(relativePath));
+    const QFileInfoList entries = folder.entryInfoList(
+        {QStringLiteral("*")}, QDir::Dirs | QDir::Files | QDir::NoDotAndDotDot,
+        QDir::DirsFirst | QDir::IgnoreCase | QDir::Name);
+
+    QVariantList rows;
+    for (const QFileInfo &entry : entries) {
+        const QString name = entry.fileName();
+        if (name.startsWith(QLatin1Char('.')))
+            continue;
+        const bool isDir = entry.isDir();
+        const QString suffix = entry.suffix().toLower();
+        if (!isDir && suffix != QStringLiteral("md") && suffix != QStringLiteral("markdown"))
+            continue;
+        rows.append(QVariantMap{
+            {QStringLiteral("name"), isDir ? name : entry.completeBaseName()},
+            {QStringLiteral("path"), root.relativeFilePath(entry.absoluteFilePath())},
+            {QStringLiteral("url"), QUrl::fromLocalFile(entry.absoluteFilePath())},
+            {QStringLiteral("isDir"), isDir}});
+    }
+    return rows;
+}
+
+QString Backend::fileTreeCurrentPath() const {
+    if (!m_fileUrl.isLocalFile())
+        return {};
+    const QString relative =
+        QDir(fileTreeRoot()).relativeFilePath(QFileInfo(m_fileUrl.toLocalFile()).absoluteFilePath());
+    return relative.startsWith(QStringLiteral("..")) ? QString() : relative;
+}
+
+QVariantList Backend::backlinks() {
+    if (!m_fileUrl.isLocalFile())
+        return {};
+    if (!m_notesIndexed || m_notesRoot != notesRoot())
+        refreshNoteIndex();
+    if (m_notesRoot.isEmpty())
+        return {};
+
+    const QDir root(m_notesRoot);
+    const QString currentPath = QFileInfo(m_fileUrl.toLocalFile()).canonicalFilePath();
+    const QString currentRelative = root.relativeFilePath(currentPath);
+    if (currentRelative.startsWith(QStringLiteral("..")))
+        return {};
+    const QString currentName = QFileInfo(currentRelative).completeBaseName();
+    const QString currentDir = QFileInfo(currentPath).absolutePath();
+
+    QString currentStem = currentRelative;
+    const int dot = currentStem.lastIndexOf(QLatin1Char('.'));
+    if (dot > currentStem.lastIndexOf(QLatin1Char('/')))
+        currentStem.truncate(dot);
+    currentStem = currentStem.toCaseFolded();
+
+    QHash<QString, int> nameCounts;
+    for (const QString &path : m_notePaths)
+        ++nameCounts[QFileInfo(path).completeBaseName().toCaseFolded()];
+    const QString foldedName = currentName.toCaseFolded();
+    // A bare [[name]] reaches a note beside the one holding it, at the vault
+    // root, or anywhere when no other note shares the name; resolveNote
+    // follows the same order.
+    const bool bareNameIsUnique = nameCounts.value(foldedName) <= 1;
+    const bool atRoot = !currentStem.contains(QLatin1Char('/'));
+
+    const auto stripExtension = [](QString name) {
+        if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
+            name.chop(9);
+        else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
+            name.chop(3);
+        return name;
+    };
+    // Whether a link written in the note at sourceDir points at the open one.
+    const auto pointsHere = [&](QString target, const QString &sourceDir) {
+        const int heading = target.indexOf(QLatin1Char('#'));
+        if (heading >= 0)
+            target.truncate(heading);
+        target = stripExtension(target.trimmed()).toCaseFolded();
+        if (target.isEmpty())
+            return false;
+        if (!target.contains(QLatin1Char('/')))
+            return target == foldedName
+                && (bareNameIsUnique || atRoot || sourceDir == currentDir);
+        if (target == currentStem)
+            return true;
+        const QString relativeToSource =
+            root.relativeFilePath(QDir(sourceDir).filePath(target)).toCaseFolded();
+        return relativeToSource == currentStem;
+    };
+
+    static const QRegularExpression wikiRe(QStringLiteral("\\[\\[([^\\]\\n]+)\\]\\]"));
+    static const QRegularExpression markdownLinkRe(
+        QStringLiteral("\\[[^\\]\\n]*\\]\\(\\s*(?:<([^>\\n]+)>|([^\\s()<>]+))[^)\\n]*\\)"));
+    static const QRegularExpression fenceRe(QStringLiteral("^\\s{0,3}(```|~~~)"));
+
+    QVariantList sources;
+    for (const QString &path : m_notePaths) {
+        if (path == currentRelative)
+            continue;
+        QFile file(root.filePath(path));
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+            continue;
+        const QString text = QString::fromUtf8(file.readAll());
+        // Cheap rejection: a link has to spell the note's name somewhere.
+        if (!text.contains(currentName, Qt::CaseInsensitive))
+            continue;
+
+        const QString sourceDir = QFileInfo(root.filePath(path)).absolutePath();
+        QVariantList mentions;
+        bool inFence = false;
+        int lineNumber = 0;
+        for (const QStringView line : QStringView(text).split(QLatin1Char('\n'))) {
+            ++lineNumber;
+            const QString lineText = line.toString();
+            if (fenceRe.match(lineText).hasMatch()) {
+                inFence = !inFence;
+                continue;
+            }
+            if (inFence)
+                continue;
+
+            bool linked = false;
+            QRegularExpressionMatchIterator wiki = wikiRe.globalMatch(lineText);
+            while (wiki.hasNext() && !linked) {
+                QString target = wiki.next().captured(1);
+                const int pipe = target.indexOf(QLatin1Char('|'));
+                if (pipe >= 0)
+                    target.truncate(pipe);
+                linked = pointsHere(target, sourceDir);
+            }
+            QRegularExpressionMatchIterator markdown = markdownLinkRe.globalMatch(lineText);
+            while (markdown.hasNext() && !linked) {
+                const QRegularExpressionMatch match = markdown.next();
+                const QString destination = QUrl::fromPercentEncoding(
+                    (match.capturedStart(1) >= 0 ? match.captured(1) : match.captured(2))
+                        .toUtf8());
+                if (destination.contains(QStringLiteral("://"))
+                        || !(destination.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive)
+                             || destination.contains(QStringLiteral(".md#"), Qt::CaseInsensitive)
+                             || destination.endsWith(QStringLiteral(".markdown"),
+                                                     Qt::CaseInsensitive)))
+                    continue;
+                // Markdown links are paths from the note holding them.
+                QString relative = destination.left(destination.indexOf(QLatin1Char('#')) < 0
+                                                        ? destination.size()
+                                                        : destination.indexOf(QLatin1Char('#')));
+                relative = QDir::cleanPath(QDir(sourceDir).filePath(relative));
+                linked = QFileInfo(relative).canonicalFilePath() == currentPath;
+            }
+            if (!linked)
+                continue;
+
+            QString shown = lineText.trimmed();
+            if (shown.size() > 240)
+                shown = shown.left(240) + QStringLiteral("…");
+            mentions.append(QVariantMap{{QStringLiteral("line"), lineNumber},
+                                        {QStringLiteral("text"), shown}});
+        }
+        if (mentions.isEmpty())
+            continue;
+
+        sources.append(QVariantMap{
+            {QStringLiteral("name"), QFileInfo(path).completeBaseName()},
+            {QStringLiteral("path"), path},
+            {QStringLiteral("url"), QUrl::fromLocalFile(root.filePath(path))},
+            {QStringLiteral("count"), int(mentions.size())},
+            {QStringLiteral("mentions"), mentions}});
+    }
+    // m_notePaths is already sorted by name, so the sources are too.
+    return sources;
+}
+
+QUrl Backend::resolveNote(const QString &target) const {
+    QString name = target.trimmed();
+    if (name.isEmpty())
+        return {};
+
+    const int heading = name.indexOf(QLatin1Char('#'));
+    if (heading >= 0)
+        name.truncate(heading);
+    name = name.trimmed();
+    if (name.endsWith(QStringLiteral(".markdown"), Qt::CaseInsensitive))
+        name.chop(9);
+    else if (name.endsWith(QStringLiteral(".md"), Qt::CaseInsensitive))
+        name.chop(3);
+    if (name.isEmpty() || name.contains(QStringLiteral(".."))
+            || QDir::isAbsolutePath(name))
+        return {};
+
+    const QStringList suffixes{QStringLiteral(".md"), QStringLiteral(".markdown")};
+    const QDir current = m_fileUrl.isLocalFile()
+        ? QFileInfo(m_fileUrl.toLocalFile()).absoluteDir()
+        : QDir(notesRoot());
+    for (const QString &suffix : suffixes) {
+        const QFileInfo beside(current.filePath(name + suffix));
+        if (beside.exists() && beside.isFile())
+            return QUrl::fromLocalFile(beside.canonicalFilePath());
+    }
+
+    const QString root = notesRoot();
+    if (root.isEmpty())
+        return {};
+    for (const QString &suffix : suffixes) {
+        const QFileInfo atRoot(QDir(root).filePath(name + suffix));
+        if (atRoot.exists() && atRoot.isFile())
+            return QUrl::fromLocalFile(atRoot.canonicalFilePath());
+    }
+
+    // Obsidian resolves a bare name anywhere in the vault. Ambiguity is not
+    // guessed at: two notes with the same name leave the link unresolved.
+    const QString wanted = QFileInfo(name).fileName();
+    QString match;
+    QDirIterator iterator(root, {QStringLiteral("*.md"), QStringLiteral("*.markdown")},
+                          QDir::Files, QDirIterator::Subdirectories);
+    while (iterator.hasNext()) {
+        iterator.next();
+        if (QFileInfo(iterator.fileName()).completeBaseName().compare(wanted,
+                                                                      Qt::CaseInsensitive) != 0)
+            continue;
+        const QString candidate = iterator.fileInfo().canonicalFilePath();
+        if (!match.isEmpty() && match != candidate)
+            return {};
+        match = candidate;
+    }
+    return match.isEmpty() ? QUrl() : QUrl::fromLocalFile(match);
+}
+
+QVariantMap Backend::wikiLinkAt(int position) const {
+    const QVariantMap none{{QStringLiteral("kind"), QStringLiteral("none")}};
+    if (!m_document)
+        return none;
+
+    const QTextBlock block =
+        m_document->findBlock(qBound(0, position, m_document->characterCount() - 1));
+    if (!block.isValid() || block.userState() >= MarkdownHighlighter::InsideFence
+            || block.previous().userState() >= MarkdownHighlighter::InsideFence)
+        return none;
+
+    const QString target =
+        MarkdownHighlighter::wikiLinkTargetAt(block.text(), position - block.position());
+    if (target.isEmpty())
+        return none;
+
+    const QUrl url = resolveNote(target);
+    if (url.isEmpty()) {
+        return {{QStringLiteral("kind"), QStringLiteral("missing")},
+                {QStringLiteral("target"), target}};
+    }
+    return {{QStringLiteral("kind"), QStringLiteral("file")},
+            {QStringLiteral("target"), target},
+            {QStringLiteral("url"), url}};
+}
+
+void Backend::reportMissingNote(const QString &target) {
+    setStatus(QStringLiteral("No note named %1").arg(target));
+}
+
+// Where a pasted image goes. In an Obsidian vault that is the vault's own
+// attachment folder setting, so Obsidian finds what Omawrite pastes:
+// "/" or unset is the vault root, "./x" sits beside the note, and anything
+// else is a folder in the vault. Elsewhere it is _attachments beside the
+// document, and an untitled one outside a vault has no folder yet.
+QString Backend::attachmentDirectory(bool *vault) const {
+    const QString root = notesRoot();
+    const bool isVault = !root.isEmpty()
+        && QDir(QDir(root).filePath(QStringLiteral(".obsidian"))).exists();
+    if (vault)
+        *vault = isVault;
+    const QString documentDir = m_fileUrl.isLocalFile()
+        ? QFileInfo(m_fileUrl.toLocalFile()).absolutePath() : QString();
+
+    if (!isVault)
+        return documentDir.isEmpty()
+            ? QString() : QDir(documentDir).filePath(QStringLiteral("_attachments"));
+
+    QString setting;
+    QFile appConfig(QDir(root).filePath(QStringLiteral(".obsidian/app.json")));
+    if (appConfig.open(QIODevice::ReadOnly)) {
+        setting = QJsonDocument::fromJson(appConfig.readAll()).object()
+                      .value(QStringLiteral("attachmentFolderPath")).toString().trimmed();
+    }
+    if (setting.isEmpty() || setting == QStringLiteral("/"))
+        return root;
+    if (setting == QStringLiteral(".") || setting.startsWith(QStringLiteral("./"))) {
+        const QString base = documentDir.isEmpty() ? root : documentDir;
+        return QDir::cleanPath(base + QLatin1Char('/') + setting.mid(1));
+    }
+    return QDir::cleanPath(root + QLatin1Char('/') + setting);
+}
+
+// A file name in folder that is not taken yet: "name.png", then "name 1.png".
+static QString freeFileName(const QDir &folder, const QString &wanted) {
+    const QFileInfo info(wanted);
+    const QString base = info.completeBaseName();
+    const QString suffix = info.suffix().isEmpty() ? QString() : QLatin1Char('.') + info.suffix();
+    QString name = wanted;
+    for (int i = 1; QFileInfo::exists(folder.filePath(name)); ++i)
+        name = QStringLiteral("%1 %2%3").arg(base).arg(i).arg(suffix);
+    return name;
+}
+
+// Saves what the clipboard holds as an image file and returns the Markdown
+// that embeds it. A screenshot or a browser's "Copy Image" arrives as image
+// data; a file manager's copy as file URLs, which are copied in. Text on the
+// clipboard wins over image data, so a spreadsheet's cells paste as text
+// rather than as a picture of them.
+QVariantMap Backend::pasteClipboardImage() {
+    const QVariantMap notHandled{{QStringLiteral("handled"), false}};
+    const QVariantMap handledNothing{{QStringLiteral("handled"), true},
+                                     {QStringLiteral("text"), QString()}};
+    const QClipboard *clipboard = QGuiApplication::clipboard();
+    const QMimeData *mimeData = clipboard ? clipboard->mimeData() : nullptr;
+    if (!mimeData)
+        return notHandled;
+
+    QStringList sourceFiles;
+    if (mimeData->hasUrls()) {
+        for (const QUrl &url : mimeData->urls()) {
+            if (!url.isLocalFile())
+                continue;
+            const QFileInfo info(url.toLocalFile());
+            if (info.isFile() && MarkdownHighlighter::isImageFileName(info.fileName()))
+                sourceFiles.append(info.absoluteFilePath());
+        }
+    }
+    const bool imageData = sourceFiles.isEmpty() && mimeData->hasImage() && !mimeData->hasText();
+    if (sourceFiles.isEmpty() && !imageData)
+        return notHandled;
+
+    bool vault = false;
+    const QString folderPath = attachmentDirectory(&vault);
+    if (folderPath.isEmpty()) {
+        setStatus(QStringLiteral("Save the document first, so the image has a folder to go in."));
+        return handledNothing;
+    }
+    if (!QDir().mkpath(folderPath)) {
+        setStatus(QStringLiteral("Could not create %1.").arg(folderPath));
+        return handledNothing;
+    }
+    const QDir folder(folderPath);
+    const QString root = notesRoot();
+
+    QStringList written;
+    if (imageData) {
+        // PNG bytes as the source sent them; anything else is encoded here.
+        QByteArray bytes = mimeData->data(QStringLiteral("image/png"));
+        if (bytes.isEmpty()) {
+            const QImage image = qvariant_cast<QImage>(mimeData->imageData());
+            QBuffer buffer(&bytes);
+            buffer.open(QIODevice::WriteOnly);
+            if (image.isNull() || !image.save(&buffer, "PNG")) {
+                setStatus(QStringLiteral("Could not read the image on the clipboard."));
+                return handledNothing;
+            }
+        }
+        // Obsidian's own name for a pasted image, so a vault reads alike
+        // whichever app pasted into it.
+        const QString name = freeFileName(folder, QStringLiteral("Pasted image %1.png")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"))));
+        QSaveFile file(folder.filePath(name));
+        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size()
+                || !file.commit()) {
+            setStatus(QStringLiteral("Could not save %1.").arg(name));
+            return handledNothing;
+        }
+        written.append(folder.filePath(name));
+    } else {
+        for (const QString &source : sourceFiles) {
+            // An image already in the vault is linked where it is.
+            if (vault && !QDir(root).relativeFilePath(source).startsWith(QStringLiteral(".."))) {
+                written.append(source);
+                continue;
+            }
+            const QString name = freeFileName(folder, QFileInfo(source).fileName());
+            if (!QFile::copy(source, folder.filePath(name))) {
+                setStatus(QStringLiteral("Could not copy %1.").arg(QFileInfo(source).fileName()));
+                return handledNothing;
+            }
+            written.append(folder.filePath(name));
+        }
+    }
+
+    m_imagePaths.clear();
+    QStringList embeds;
+    for (const QString &path : written) {
+        if (vault) {
+            // Obsidian finds a bare name anywhere in the vault; a file
+            // outside the attachment folder keeps its path to stay unambiguous.
+            const QString target = QFileInfo(path).absolutePath() == folder.absolutePath()
+                ? QFileInfo(path).fileName() : QDir(root).relativeFilePath(path);
+            embeds.append(QStringLiteral("![[%1]]").arg(target));
+        } else {
+            const QString relative =
+                QFileInfo(m_fileUrl.toLocalFile()).absoluteDir().relativeFilePath(path);
+            embeds.append(QStringLiteral("![](%1)").arg(
+                QString::fromUtf8(QUrl::toPercentEncoding(relative, "/"))));
+        }
+    }
+    setStatus(written.size() == 1 ? QStringLiteral("Pasted %1").arg(QFileInfo(written.first()).fileName())
+                                  : QStringLiteral("Pasted %1 images").arg(written.size()));
+    return {{QStringLiteral("handled"), true},
+            {QStringLiteral("text"), embeds.join(QLatin1Char('\n'))}};
+}
+
+// The file an embed names. A Markdown path is relative to the document; an
+// Obsidian name is looked for beside it, in the attachment folder, at the
+// vault root, and then anywhere in the vault, as Obsidian does.
+QString Backend::resolveImage(const QString &target, bool wiki) const {
+    const QString documentDir = m_fileUrl.isLocalFile()
+        ? QFileInfo(m_fileUrl.toLocalFile()).absolutePath() : QString();
+    const QString key = documentDir + QLatin1Char('\n') + (wiki ? QLatin1Char('w') : QLatin1Char('m'))
+        + target;
+    const auto cached = m_imagePaths.constFind(key);
+    if (cached != m_imagePaths.constEnd() && (cached->isEmpty() || QFileInfo::exists(*cached)))
+        return *cached;
+
+    const auto existing = [](const QString &path) {
+        const QFileInfo info(path);
+        return info.isFile() ? info.absoluteFilePath() : QString();
+    };
+    const QString root = notesRoot();
+    const QString base = documentDir.isEmpty() ? root : documentDir;
+    QString found;
+
+    if (!wiki) {
+        QString path = target;
+        const QUrl url(target);
+        if (url.isLocalFile())
+            path = url.toLocalFile();
+        else if (!url.scheme().isEmpty() && url.scheme().size() > 1)
+            path.clear(); // A web image is not fetched.
+        else
+            path = QUrl::fromPercentEncoding(target.toUtf8());
+        if (!path.isEmpty()) {
+            if (path.startsWith(QStringLiteral("~/")))
+                path = QDir::home().filePath(path.mid(2));
+            found = QDir::isAbsolutePath(path) ? existing(path)
+                : base.isEmpty() ? QString() : existing(QDir(base).filePath(path));
+        }
+    } else if (!root.isEmpty() || !base.isEmpty()) {
+        const QStringList folders{base, attachmentDirectory(nullptr), root};
+        for (const QString &folder : folders) {
+            if (!folder.isEmpty())
+                found = existing(QDir(folder).filePath(target));
+            if (!found.isEmpty())
+                break;
+        }
+        if (found.isEmpty() && !root.isEmpty()) {
+            const QString wanted = QFileInfo(target).fileName();
+            QDirIterator iterator(root, QDir::Files, QDirIterator::Subdirectories);
+            while (iterator.hasNext()) {
+                const QString path = iterator.next();
+                if (iterator.fileName().compare(wanted, Qt::CaseInsensitive) == 0
+                        && !QDir(root).relativeFilePath(path).startsWith(QLatin1Char('.'))) {
+                    found = iterator.fileInfo().absoluteFilePath();
+                    break;
+                }
+            }
+        }
+    }
+
+    m_imagePaths.insert(key, found);
+    return found;
+}
+
+int Backend::imagePadding() const {
+    if (!m_document)
+        return 0;
+    return qRound(QFontMetricsF(m_document->defaultFont()).height() * 0.3);
+}
+
+QSize Backend::blockImageSize(const QTextBlock &block, QString *path, QSize *natural) const {
+    if (!block.isValid() || block.userState() >= MarkdownHighlighter::InsideFence
+            || block.previous().userState() >= MarkdownHighlighter::InsideFence)
+        return {};
+    const MarkdownHighlighter::ImageEmbed embed = MarkdownHighlighter::imageEmbed(block.text());
+    if (!embed.isValid())
+        return {};
+    const QString file = resolveImage(embed.target, embed.wiki);
+    if (file.isEmpty())
+        return {};
+
+    auto pixels = m_imageSizes.constFind(file);
+    if (pixels == m_imageSizes.constEnd())
+        pixels = m_imageSizes.insert(file, QImageReader(file).size());
+    if (!pixels->isValid() || pixels->isEmpty())
+        return {};
+
+    // Drawn at its size in logical pixels, so a screenshot from a HiDPI
+    // screen comes back at the size it was on screen, never wider than the
+    // writing column, and no taller than that column is wide.
+    const qreal ratio = m_parentWindow && m_parentWindow->devicePixelRatio() > 0
+        ? m_parentWindow->devicePixelRatio() : 1.0;
+    if (natural)
+        *natural = QSize(qMax(1, qRound(pixels->width() / ratio)),
+                         qMax(1, qRound(pixels->height() / ratio)));
+    const qreal areaWidth = m_imageAreaWidth > 0 ? m_imageAreaWidth
+        : (m_document && m_document->textWidth() > 0 ? m_document->textWidth() : 600);
+    qreal width = embed.width > 0 ? embed.width : pixels->width() / ratio;
+    width = qMin(width, areaWidth);
+    qreal height = width * pixels->height() / pixels->width();
+    if (height > areaWidth) {
+        height = areaWidth;
+        width = height * pixels->width() / pixels->height();
+    }
+    if (path)
+        *path = file;
+    return QSize(qMax(1, qRound(width)), qMax(1, qRound(height)));
+}
+
+qreal Backend::blockImageMargin(const QTextBlock &block) const {
+    const QSize size = blockImageSize(block);
+    return size.isEmpty() ? 0 : size.height() + 2 * imagePadding();
+}
+
+// Every image line, in document order, for the editor to draw them.
+QVariantList Backend::imageEmbeds() const {
+    QVariantList images;
+    if (!m_document)
+        return images;
+    const int padding = imagePadding();
+    for (QTextBlock block = m_document->begin(); block.isValid(); block = block.next()) {
+        if (!block.text().contains(QStringLiteral("![")))
+            continue;
+        QString path;
+        QSize natural;
+        const QSize size = blockImageSize(block, &path, &natural);
+        if (size.isEmpty())
+            continue;
+        images.append(QVariantMap{
+            {QStringLiteral("blockStart"), block.position()},
+            {QStringLiteral("blockEnd"), block.position() + block.length() - 1},
+            {QStringLiteral("imageUrl"), QUrl::fromLocalFile(path)},
+            {QStringLiteral("imageName"), QFileInfo(path).fileName()},
+            {QStringLiteral("imageWidth"), size.width()},
+            {QStringLiteral("imageHeight"), size.height()},
+            {QStringLiteral("naturalWidth"), natural.width()},
+            {QStringLiteral("naturalHeight"), natural.height()},
+            {QStringLiteral("imagePad"), padding}});
+    }
+    return images;
+}
+
+// The image an embed under position names, so Ctrl+Click can open it.
+QUrl Backend::imageUrlAt(int position) const {
+    if (!m_document)
+        return {};
+    const QTextBlock block =
+        m_document->findBlock(qBound(0, position, m_document->characterCount() - 1));
+    const MarkdownHighlighter::ImageEmbed embed = MarkdownHighlighter::imageEmbed(block.text());
+    const int offset = position - block.position();
+    if (!embed.isValid() || offset < embed.start || offset >= embed.start + embed.length)
+        return {};
+    QString path;
+    if (blockImageSize(block, &path).isEmpty())
+        return {};
+    return QUrl::fromLocalFile(path);
+}
+
+void Backend::openImage(const QUrl &url) {
+    if (!url.isLocalFile() || !QDesktopServices::openUrl(url))
+        setStatus(QStringLiteral("Could not open %1").arg(url.fileName()));
+}
+
+// The writing column's full width. Image lines reserve their height from it,
+// so it is measured again when the font or text size changes it.
+void Backend::setImageAreaWidth(int width) {
+    if (width == m_imageAreaWidth)
+        return;
+    m_imageAreaWidth = width;
+    applyHangingIndents(false);
 }
 
 int Backend::cursorPositionStep(int position, int direction) const
@@ -791,6 +2057,7 @@ QStringList Backend::selectableFontFamilies(const QStringList &families) {
 void Backend::documentFontChanged() {
     if (m_highlighter)
         m_highlighter->refreshFont();
+    applyHangingIndents(false);
 }
 
 void Backend::loadDocumentText(const QString &text) {
@@ -816,6 +2083,7 @@ void Backend::setFileUrl(const QUrl &url) {
         return;
 
     m_fileUrl = url;
+    m_imagePaths.clear();
     emit fileUrlChanged();
 }
 
@@ -993,15 +2261,17 @@ void Backend::restoreRecovery() {
         return;
     }
     const QJsonObject recovery = json.object();
-    loadDocumentText(recovery.value(QStringLiteral("text")).toString());
     const QUrl recoveredUrl(recovery.value(QStringLiteral("fileUrl")).toString());
+    // Before the text is laid out, so image embeds resolve against the
+    // recovered document's folder.
+    setFileUrl(recoveredUrl);
+    loadDocumentText(recovery.value(QStringLiteral("text")).toString());
     QFile diskFile(recoveredUrl.toLocalFile());
     if (recoveredUrl.isLocalFile() && diskFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         setKnownFileContents(diskFile.readAll(), true);
     } else {
         setKnownFileContents(QByteArray(), false);
     }
-    setFileUrl(recoveredUrl);
     // The file may have moved on since this draft was written, and the draft
     // alone cannot tell. Leave overwriting it to an explicit save.
     m_autoSaveSuspended = recoveredUrl.isLocalFile();
@@ -1222,18 +2492,26 @@ int Backend::countWords(const QString &text) {
         QStringLiteral("(?=[\\p{L}\\p{N}])[\\p{Han}\\p{Hiragana}\\p{Katakana}]"));
     thread_local const QRegularExpression wordRe(
         QStringLiteral("[\\p{L}\\p{N}]+(?:['-][\\p{L}\\p{N}]+)*"));
+    // A task marker is punctuation and state, not a word: the "x" of "[x]"
+    // should count the same as the space of "[ ]".
+    thread_local const QRegularExpression taskRe(
+        QStringLiteral("^([ \\t]*(?:[-+*]|\\d+[.)])[ \\t]+)\\[[ xX]\\](?=[ \\t]|\\r?$)"),
+        QRegularExpression::MultilineOption);
+
+    QString counted = text;
+    counted.replace(taskRe, QStringLiteral("\\1"));
 
     // Count unspaced Han and kana characters individually, then replace them
     // so they remain boundaries between surrounding space-delimited words.
     int count = 0;
 
-    QRegularExpressionMatchIterator cjkIt = cjkRe.globalMatch(text);
+    QRegularExpressionMatchIterator cjkIt = cjkRe.globalMatch(counted);
     while (cjkIt.hasNext()) {
         cjkIt.next();
         ++count;
     }
 
-    QString nonCjkText = text;
+    QString nonCjkText = counted;
     nonCjkText.replace(cjkRe, QStringLiteral(" "));
 
     QRegularExpressionMatchIterator it = wordRe.globalMatch(nonCjkText);
@@ -1296,6 +2574,65 @@ void Backend::applyDocumentTypography() {
     m_formattingTypography = false;
 
     m_document->setUndoRedoEnabled(undoEnabled);
+    applyHangingIndents(true);
+}
+
+// Block indents are measured in pixels, so a typeface change has to measure
+// them again. Undo is left alone: the writer's history is worth more than the
+// one formatting step this adds.
+void Backend::applyHangingIndents(bool clearUndo) {
+    if (!m_document)
+        return;
+
+    // One document unit per pixel, so a block's indent is the exact width of
+    // its list marker rather than a multiple of Qt's default 40px step.
+    m_document->setIndentWidth(1.0);
+
+    const QFontMetricsF metrics(m_document->defaultFont());
+    const QFont font = m_document->defaultFont();
+    const auto wantedFormat = [this, &metrics, &font](const QTextBlock &block) {
+        QTextBlockFormat format = hangingIndentFormat(block.text(), metrics, font);
+        format.setBottomMargin(blockImageMargin(block));
+        return format;
+    };
+    QList<QTextBlock> changed;
+    for (QTextBlock block = m_document->begin(); block.isValid(); block = block.next()) {
+        const QTextBlockFormat current = block.blockFormat();
+
+        const QTextBlockFormat wanted = wantedFormat(block);
+        if (current.indent() == wanted.indent()
+                && qFuzzyCompare(current.textIndent() + 1, wanted.textIndent() + 1)
+                && qFuzzyCompare(current.bottomMargin() + 1, wanted.bottomMargin() + 1))
+            continue;
+        changed.append(block);
+    }
+    if (changed.isEmpty())
+        return;
+
+    const bool undoEnabled = m_document->isUndoRedoEnabled();
+    if (clearUndo)
+        m_document->setUndoRedoEnabled(false);
+
+    m_formattingTypography = true;
+    QTextCursor cursor(m_document);
+    if (!clearUndo)
+        cursor.beginEditBlock();
+    for (const QTextBlock &block : changed) {
+        cursor.setPosition(block.position());
+        cursor.mergeBlockFormat(wantedFormat(block));
+    }
+    if (!clearUndo)
+        cursor.endEditBlock();
+    // The highlighter hides an image line's text only once room is made
+    // for its image, so look at those lines again.
+    if (m_highlighter) {
+        for (const QTextBlock &block : changed)
+            m_highlighter->rehighlightBlock(block);
+    }
+    m_formattingTypography = false;
+
+    if (clearUndo)
+        m_document->setUndoRedoEnabled(undoEnabled);
 }
 
 void Backend::reapplyTypographyToChange() {
@@ -1309,15 +2646,30 @@ void Backend::reapplyTypographyToChange() {
     const int start = qBound(0, m_lastChangePos, maxPos);
     const int end = qBound(start, m_lastChangePos + m_lastChangeAdded, maxPos);
 
+    const QFontMetricsF metrics(m_document->defaultFont());
+    const QFont font = m_document->defaultFont();
+    const auto wantedFormat = [this, &metrics, &font](const QTextBlock &block) {
+        const QTextBlockFormat indent = hangingIndentFormat(block.text(), metrics, font);
+        QTextBlockFormat format = lineHeightFormat();
+        format.setIndent(indent.indent());
+        format.setTextIndent(indent.textIndent());
+        format.setBottomMargin(blockImageMargin(block));
+        return format;
+    };
+
     // Blocks that already have it are left alone: an undo brings their format
     // back with the text, and merging anyway would push a command that clears
     // the redo stack.
     bool needed = false;
     for (QTextBlock block = m_document->findBlock(start);
          block.isValid() && block.position() <= end; block = block.next()) {
-        const QTextBlockFormat format = block.blockFormat();
-        if (format.lineHeightType() != QTextBlockFormat::ProportionalHeight
-                || format.lineHeight() != typoraLineHeightPercent) {
+        const QTextBlockFormat current = block.blockFormat();
+        const QTextBlockFormat wanted = wantedFormat(block);
+        if (current.lineHeightType() != wanted.lineHeightType()
+                || current.lineHeight() != wanted.lineHeight()
+                || current.indent() != wanted.indent()
+                || !qFuzzyCompare(current.textIndent() + 1, wanted.textIndent() + 1)
+                || !qFuzzyCompare(current.bottomMargin() + 1, wanted.bottomMargin() + 1)) {
             needed = true;
             break;
         }
@@ -1328,9 +2680,16 @@ void Backend::reapplyTypographyToChange() {
     m_formattingTypography = true;
     QTextCursor cursor(m_document);
     cursor.joinPreviousEditBlock();
-    cursor.setPosition(start);
-    cursor.setPosition(end, QTextCursor::KeepAnchor);
-    cursor.mergeBlockFormat(lineHeightFormat());
+    for (QTextBlock block = m_document->findBlock(start);
+         block.isValid() && block.position() <= end; block = block.next()) {
+        cursor.setPosition(block.position());
+        cursor.mergeBlockFormat(wantedFormat(block));
+    }
     cursor.endEditBlock();
+    if (m_highlighter) {
+        for (QTextBlock block = m_document->findBlock(start);
+             block.isValid() && block.position() <= end; block = block.next())
+            m_highlighter->rehighlightBlock(block);
+    }
     m_formattingTypography = false;
 }

@@ -140,6 +140,19 @@ void MarkdownHighlighter::rebuildFormats() {
     m_hiddenMarkerFormat.setFontLetterSpacingType(QFont::AbsoluteSpacing);
     m_hiddenMarkerFormat.setFontLetterSpacing(-charWidth);
 
+    // A task's "[ ]" is replaced by a drawn checkbox. Hide the three characters
+    // but spread their tiny advances so the run takes exactly the checkbox's
+    // width, leaving the text after it where the checkbox ends.
+    m_taskMarkerFormat = QTextCharFormat();
+    m_taskMarkerFormat.setForeground(background);
+    m_taskMarkerFormat.setFontPointSize(1.0);
+    const qreal markerWidth = QFontMetricsF(hiddenFont)
+        .horizontalAdvance(QStringLiteral("[ ]"));
+    const qreal checkboxWidth = taskCheckboxWidth(document() ? document()->defaultFont()
+                                                             : QFont());
+    m_taskMarkerFormat.setFontLetterSpacingType(QFont::AbsoluteSpacing);
+    m_taskMarkerFormat.setFontLetterSpacing((checkboxWidth - markerWidth) / 3.0);
+
     m_headingFormat = QTextCharFormat();
     m_headingFormat.setForeground(text);
     m_headingFormat.setFontWeight(QFont::Bold);
@@ -199,6 +212,16 @@ void MarkdownHighlighter::highlightBlock(const QString &text) {
         return;
     }
     setCurrentBlockState(Prose);
+
+    // Backend reserves room below a line whose image it found, and the editor
+    // draws the image there; the line's own text steps aside until the caret
+    // comes to edit it. A broken embed has no room and keeps its text.
+    if (currentBlock().blockFormat().bottomMargin() > 0
+            && (m_caret.isNull() || m_caret.block() != currentBlock())
+            && imageEmbed(text).isValid()) {
+        setFormat(0, text.length(), m_hiddenMarkerFormat);
+        return;
+    }
 
     if (!text.isEmpty()) {
         highlightMarkers(text);
@@ -392,6 +415,19 @@ void MarkdownHighlighter::highlightMarkers(const QString &text) {
             setFormat(0, list.capturedLength(1), m_markerFormat);
     }
 
+    // A checkbox is drawn over its marker unless the caret is in it, when the
+    // raw "[ ]" or "[x]" shows so it can be edited like any other marker. The
+    // caret just after the closing bracket already reads as past the marker,
+    // so typing "- [ ]" reveals the checkbox at once.
+    const TaskMarker task = taskMarker(text);
+    if (task.isValid()) {
+        const int caret = !m_caret.isNull() && m_caret.block() == currentBlock()
+            ? m_caret.positionInBlock() : -1;
+        const bool atCaret = caret >= task.start && caret < task.start + task.length;
+        setFormat(task.start, task.length,
+                  atCaret ? m_markerFormat : m_taskMarkerFormat);
+    }
+
     if (isThematicBreak(text))
         setFormat(0, text.length(), m_markerFormat);
 }
@@ -401,6 +437,27 @@ void MarkdownHighlighter::highlightMarkers(const QString &text) {
 bool MarkdownHighlighter::isThematicBreak(const QString &text) {
     static const QRegularExpression ruleRe(QStringLiteral("^\\s{0,3}([-*_])(?:\\s*\\1){2,}\\s*$"));
     return ruleRe.match(text).hasMatch();
+}
+
+// The task marker of a list item, if it has one. GFM asks for whitespace after
+// the closing bracket, or the end of the line, so "- [ ]task" is ordinary text.
+MarkdownHighlighter::TaskMarker MarkdownHighlighter::taskMarker(const QString &text) {
+    static const QRegularExpression taskRe(
+        QStringLiteral("^([ \\t]*(?:[-+*]|\\d+[.)])[ \\t]+)\\[([ xX])\\](?=[ \\t]|$)"));
+    const QRegularExpressionMatch match = taskRe.match(text);
+    if (!match.hasMatch())
+        return {};
+    return {int(match.capturedLength(1)), 3, match.captured(2) != QLatin1String(" ")};
+}
+
+// Sized from the editor's font, with a floor so a checkbox stays clickable at
+// small text sizes. The marker's hidden run and the QML overlay use this same
+// width, keeping the text after it in one place whether or not it is drawn.
+qreal MarkdownHighlighter::taskCheckboxWidth(const QFont &font) {
+    const qreal pixelSize = font.pixelSize() > 0
+        ? font.pixelSize()
+        : (font.pointSizeF() > 0 ? font.pointSizeF() * 96.0 / 72.0 : 14.0);
+    return qMax(10.0, qreal(qRound(pixelSize * 0.72)));
 }
 
 void MarkdownHighlighter::highlightInline(const QString &text) {
@@ -536,9 +593,52 @@ QList<MarkdownHighlighter::InlineMarkup> MarkdownHighlighter::inlineMarkup(const
     // the outer two asterisks of each run are bold, the inner one italic. Its
     // runs are then masked so the patterns below do not split them again.
     QString unclaimed = text;
+
+    // Obsidian-style [[wikilinks]] hold a literal note name, not Markdown, so
+    // parse them before emphasis: a name with * or _ stays a name. In
+    // [[note|alias]] the target and pipe hide with the brackets, leaving the
+    // alias, and [[note#heading]] keeps its heading visible.
+    static const QRegularExpression wikiRe(
+        QStringLiteral("\\[\\[([^\\]\\n]+)\\]\\]"));
+    QRegularExpressionMatchIterator wikiMatches = wikiRe.globalMatch(text);
+    while (wikiMatches.hasNext()) {
+        const QRegularExpressionMatch match = wikiMatches.next();
+        const int wholeStart = int(match.capturedStart(0));
+        const int wholeLength = int(match.capturedLength(0));
+        const QString inner = match.captured(1);
+        const int innerStart = int(match.capturedStart(1));
+        const int pipe = inner.indexOf(QLatin1Char('|'));
+        QString target = pipe >= 0 ? inner.left(pipe) : inner;
+        target = target.trimmed();
+        const int hash = target.indexOf(QLatin1Char('#'));
+        const QString note = (hash >= 0 ? target.left(hash) : target).trimmed();
+        if (note.isEmpty())
+            continue;
+
+        Span content;
+        Span markerStart;
+        if (pipe >= 0) {
+            const int aliasStart = pipe + 1;
+            if (aliasStart >= inner.length())
+                continue;
+            content = {innerStart + aliasStart, inner.length() - aliasStart};
+            markerStart = {wholeStart, innerStart + aliasStart - wholeStart};
+        } else {
+            content = {innerStart, inner.length()};
+            markerStart = {wholeStart, 2};
+        }
+        const Span markerEnd{wholeStart + wholeLength - 2, 2};
+        const int targetStart = innerStart + inner.indexOf(note);
+        if (append({InlineKind::WikiLink, content, {markerStart, markerEnd},
+                    {targetStart, note.length()}})) {
+            for (int i = wholeStart; i < wholeStart + wholeLength; ++i)
+                unclaimed[i] = QChar::ObjectReplacementCharacter;
+        }
+    }
+
     static const QRegularExpression boldItalicRe(
         QStringLiteral("(?<!\\*)\\*\\*\\*(?![\\s*])(.*?[^\\s*])\\*\\*\\*(?!\\*)"));
-    QRegularExpressionMatchIterator boldItalicMatches = boldItalicRe.globalMatch(text);
+    QRegularExpressionMatchIterator boldItalicMatches = boldItalicRe.globalMatch(unclaimed);
     while (boldItalicMatches.hasNext()) {
         const QRegularExpressionMatch match = boldItalicMatches.next();
         const Span whole = span(match, 0);
@@ -626,6 +726,95 @@ QString MarkdownHighlighter::linkUrlAt(const QString &text, int position) {
             QStringLiteral(R"(\\([!-/:-@\[-`{-~]))"));
         return text.mid(item.destination.start, item.destination.length)
             .replace(escapedPunctuation, QStringLiteral("\\1"));
+    }
+
+    // Bare URLs are clickable too, even though they are not styled. Trailing
+    // sentence punctuation is not part of the address.
+    static const QRegularExpression bareRe(
+        QStringLiteral("\\bhttps?://[^\\s<>\\[\\]()]+"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QList<Span> code = codeSpans(text);
+    QRegularExpressionMatchIterator bareMatches = bareRe.globalMatch(text);
+    while (bareMatches.hasNext()) {
+        const QRegularExpressionMatch match = bareMatches.next();
+        const int start = int(match.capturedStart(0));
+        int length = int(match.capturedLength(0));
+        while (length > 0
+               && QStringLiteral(".,;:!?").contains(text.at(start + length - 1)))
+            --length;
+        if (position < start || position >= start + length)
+            continue;
+        bool insideCode = false;
+        for (const Span &span : code) {
+            if (position >= span.start && position < span.start + span.length) {
+                insideCode = true;
+                break;
+            }
+        }
+        if (!insideCode)
+            return text.mid(start, length);
+    }
+    return {};
+}
+
+bool MarkdownHighlighter::isImageFileName(const QString &name) {
+    static const QStringList suffixes{
+        QStringLiteral("png"), QStringLiteral("jpg"), QStringLiteral("jpeg"),
+        QStringLiteral("gif"), QStringLiteral("webp"), QStringLiteral("bmp"),
+        QStringLiteral("svg"), QStringLiteral("avif")};
+    const int dot = name.lastIndexOf(QLatin1Char('.'));
+    return dot >= 0 && suffixes.contains(name.mid(dot + 1).toLower());
+}
+
+MarkdownHighlighter::ImageEmbed MarkdownHighlighter::imageEmbed(const QString &text) {
+    if (!text.contains(QStringLiteral("![")))
+        return {};
+
+    // ![[name.png]], ![[name.png|300]] or ![[name.png|300x200]].
+    static const QRegularExpression wikiRe(QStringLiteral(
+        "^\\s*(!\\[\\[([^\\]|\\n]+)(?:\\|\\s*(\\d+)(?:\\s*x\\s*\\d+)?\\s*)?\\]\\])\\s*$"));
+    const QRegularExpressionMatch wiki = wikiRe.match(text);
+    if (wiki.hasMatch()) {
+        const QString target = wiki.captured(2).trimmed();
+        if (!isImageFileName(target))
+            return {};
+        ImageEmbed embed;
+        embed.start = int(wiki.capturedStart(1));
+        embed.length = int(wiki.capturedLength(1));
+        embed.target = target;
+        embed.wiki = true;
+        embed.width = wiki.captured(3).toInt();
+        return embed;
+    }
+
+    // ![alt](path), ![alt](<path with spaces>) and ![alt](path "title").
+    static const QRegularExpression markdownRe(QStringLiteral(
+        "^\\s*(!\\[[^\\]\\n]*\\]\\(\\s*(?:<([^>\\n]+)>|([^\\s()<>]+))(?:\\s+\"[^\"\\n]*\")?\\s*\\))\\s*$"));
+    const QRegularExpressionMatch markdown = markdownRe.match(text);
+    if (!markdown.hasMatch())
+        return {};
+    const QString target = markdown.capturedStart(2) >= 0 ? markdown.captured(2)
+                                                         : markdown.captured(3);
+    if (!isImageFileName(target))
+        return {};
+    ImageEmbed embed;
+    embed.start = int(markdown.capturedStart(1));
+    embed.length = int(markdown.capturedLength(1));
+    embed.target = target;
+    return embed;
+}
+
+QString MarkdownHighlighter::wikiLinkTargetAt(const QString &text, int position) {
+    if (position < 0 || position >= text.length())
+        return {};
+
+    for (const InlineMarkup &item : inlineMarkup(text)) {
+        if (item.kind != InlineKind::WikiLink)
+            continue;
+        const int start = item.markers[0].start;
+        const int end = item.markers[1].start + item.markers[1].length;
+        if (position >= start && position < end)
+            return text.mid(item.destination.start, item.destination.length);
     }
     return {};
 }

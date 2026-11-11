@@ -14,10 +14,18 @@ Dialog {
     property int containerWidth: 1280
     property int containerHeight: 820
     readonly property string versionText: "Omawrite " + Qt.application.version
-    readonly property var shortcuts: [
+    // The rebindable keys, read live from the backend when the dialog opens;
+    // the rest are handled by the editor itself and cannot move.
+    property var shortcuts: fixedShortcuts
+    readonly property var fixedShortcuts: [
         { key: "Ctrl+S", desc: "Save" },
         { key: "Ctrl+Shift+S", desc: "Save As" },
-        { key: "Ctrl+O", desc: "Open" },
+        { key: "Ctrl+O", desc: "File Viewer (Show / Hide)" },
+        { key: "Ctrl+Shift+O", desc: "Open Other File" },
+        { key: "Ctrl+1 … Ctrl+9", desc: "Go to Tab (9 = Last)" },
+        { key: "Ctrl+Tab / Ctrl+Shift+Tab", desc: "Next / Previous Tab" },
+        { key: "Ctrl+W", desc: "Close Tab" },
+        { key: "Ctrl+Shift+B", desc: "Linked Mentions (Backlinks)" },
         { key: "Ctrl+N", desc: "New Window" },
         { key: "Ctrl+P", desc: "Print" },
         { key: "Ctrl+Z", desc: "Undo" },
@@ -26,18 +34,39 @@ Dialog {
         { key: "Ctrl+F", desc: "Find" },
         { key: "Ctrl+H", desc: "Find & Replace" },
         { key: "Ctrl+G / Enter", desc: "Next Match in Find" },
-        { key: "Shift+Enter", desc: "Previous Match in Find" },
-        { key: "Escape", desc: "Close Find" },
+        { key: "Shift+Enter", desc: "Previous Match (in Find)" },
+        { key: "Escape", desc: "Close Find / Image Viewer" },
         { key: "Ctrl+B", desc: "Bold" },
         { key: "Ctrl+I", desc: "Italic" },
         { key: "Ctrl+Shift+X", desc: "Strikethrough" },
         { key: "Ctrl+K", desc: "Link" },
+        { key: "Ctrl+Enter", desc: "Follow Link" },
+        { key: "Ctrl+Shift+Enter", desc: "Toggle Checkbox" },
+        { key: "Ctrl+Click", desc: "Follow Link (Opens a Tab)" },
+        { key: "Tab / Shift+Tab", desc: "Nest / Outdent List" },
+        { key: "Shift+Enter", desc: "Soft Line Break (in Editor)" },
+        { key: "Ctrl+V / Shift+Insert", desc: "Paste Image, Link, or Text" },
+        { key: "← / →", desc: "Previous / Next Image" },
         { key: "Ctrl+Shift+C", desc: "Copy as HTML" },
+        { key: "Page Up / Page Down", desc: "Page Up / Down" },
+        { key: "Ctrl+Home / Ctrl+End", desc: "Document Start / End" },
         { key: "Ctrl+= / Ctrl++", desc: "Increase Text Size" },
         { key: "Ctrl+-", desc: "Decrease Text Size" },
         { key: "Ctrl+0", desc: "Reset Text Size" },
         { key: "Ctrl+scroll", desc: "Change Text Size" },
+        { key: "Alt+C / Alt+D / Alt+S", desc: "Unsaved Dialog Choices" },
         { key: "Ctrl+? / Ctrl+/ / F1", desc: "Shortcuts" }
+    ]
+    readonly property var editorShortcuts: [
+        { key: "Ctrl+Click", desc: "Follow Link (Opens a Tab)" },
+        { key: "Tab / Shift+Tab", desc: "Nest / Outdent List" },
+        { key: "Shift+Enter", desc: "Soft Line Break (in Editor)" },
+        { key: "Ctrl+V / Shift+Insert", desc: "Paste Image, Link, or Text" },
+        { key: "← / →", desc: "Previous / Next Image" },
+        { key: "Page Up / Page Down", desc: "Page Up / Down" },
+        { key: "Ctrl+Home / Ctrl+End", desc: "Document Start / End" },
+        { key: "Ctrl+scroll", desc: "Change Text Size" },
+        { key: "Alt+C / Alt+D / Alt+S", desc: "Unsaved Dialog Choices" }
     ]
 
     title: "Keyboard shortcuts"
@@ -53,7 +82,14 @@ Dialog {
     y: Math.round((containerHeight - height) / 2)
     padding: 24
 
-    onOpened: closeButton.forceActiveFocus()
+    onOpened: {
+        var live = [];
+        var rows = backend.shortcutRows();
+        for (var i = 0; i < rows.length; ++i)
+            live.push({ key: rows[i].sequence, desc: rows[i].description });
+        shortcuts = live.concat(editorShortcuts);
+        closeButton.forceActiveFocus();
+    }
 
     Overlay.modal: Rectangle { color: Qt.rgba(0, 0, 0, 0.65) }
 

@@ -8,12 +8,15 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <QHash>
+#include <QSize>
 #include <QUrl>
 #include <QVariantList>
 #include <memory>
 
 class MarkdownHighlighter;
 class QFont;
+class QTextBlock;
 class QTextDocument;
 class QWindow;
 class QLockFile;
@@ -21,6 +24,7 @@ class QLockFile;
 class Backend : public QObject {
     Q_OBJECT
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY fileUrlChanged)
+    Q_PROPERTY(QUrl documentFolder READ documentFolder NOTIFY fileUrlChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY fileUrlChanged)
     Q_PROPERTY(bool modified READ modified NOTIFY modifiedChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
@@ -34,6 +38,13 @@ class Backend : public QObject {
     Q_PROPERTY(QString themeSelectionForeground READ themeSelectionForeground NOTIFY themeColorsChanged)
     Q_PROPERTY(QString editorFont READ editorFont WRITE setEditorFont NOTIFY editorFontChanged)
     Q_PROPERTY(QStringList availableFonts READ availableFonts CONSTANT)
+    Q_PROPERTY(double scrollSpeed READ scrollSpeed WRITE setScrollSpeed NOTIFY scrollSpeedChanged)
+    // The file viewer's source: "links" follows the notes' up: links like
+    // Obsidian's VirtFolder, "folders" shows the folders on disk.
+    Q_PROPERTY(QString treeMode READ treeMode WRITE setTreeMode NOTIFY treeModeChanged)
+    // The active key bindings by action id, so the Shortcut items and the
+    // settings dialog read the same values and follow overrides live.
+    Q_PROPERTY(QVariantMap shortcutMap READ shortcutMap NOTIFY shortcutsChanged)
 
 public:
     explicit Backend(QObject *parent = nullptr);
@@ -42,6 +53,7 @@ public:
     void setParentWindow(QWindow *window);
 
     QUrl fileUrl() const { return m_fileUrl; }
+    QUrl documentFolder() const;
     QString fileName() const;
 
     bool modified() const { return m_modified; }
@@ -91,8 +103,57 @@ public:
     Q_INVOKABLE bool editorTextChanged();
     Q_INVOKABLE void setCaretPosition(int position);
     Q_INVOKABLE QString linkUrlAt(int position) const;
+    Q_INVOKABLE QVariantList taskMarkers() const;
+    Q_INVOKABLE bool toggleTaskAt(int position);
+    Q_INVOKABLE void openExternalUrl(const QString &url);
+    Q_INVOKABLE QVariantMap wikiLinkAt(int position) const;
+    Q_INVOKABLE void reportMissingNote(const QString &target);
+    Q_INVOKABLE void refreshNoteIndex();
+    Q_INVOKABLE QVariantList noteSuggestions(const QString &query);
+    // The frontmatter a note carries: its up: parents (wikilink targets with
+    // brackets, aliases, and headings stripped) and its tags.
+    Q_INVOKABLE QVariantMap noteFrontmatter(const QString &relativePath);
+    // The slipbox as a link tree: notes nested under the notes their up:
+    // field names, orphans as roots, drawings left out. Each row holds its
+    // name, path, url, tags, direct childCount, and nested children rows.
+    Q_INVOKABLE QVariantList virtFolderTree();
+    // The notes in the slipbox that link to the open one, each with the lines
+    // that do: Obsidian's "Linked mentions". Reads from disk, so a note that
+    // links here only in unsaved text elsewhere is not counted.
+    Q_INVOKABLE QVariantList backlinks();
+    // The file viewer's folder tree. The root is the vault (or the open
+    // note's folder), or the home folder when nothing is open. listFolder
+    // gives one level: folders first, then Markdown notes, as paths relative
+    // to the root. Dot folders are left out, as in the [[ suggestions.
+    Q_INVOKABLE QString fileTreeRoot() const;
+    Q_INVOKABLE QVariantList listFolder(const QString &relativePath) const;
+    // The open note's path from the root, or empty when it is not under it.
+    Q_INVOKABLE QString fileTreeCurrentPath() const;
+    Q_INVOKABLE QVariantMap pasteClipboardImage();
+    // Every image line, in document order, with the size it is drawn at in
+    // the editor and its own pixel size for the full-window viewer.
+    Q_INVOKABLE QVariantList imageEmbeds() const;
+    Q_INVOKABLE QUrl imageUrlAt(int position) const;
+    Q_INVOKABLE void openImage(const QUrl &url);
+    Q_INVOKABLE void setImageAreaWidth(int width);
     Q_INVOKABLE QVariantMap emphasisSpanAt(int position, const QString &marker) const;
-    Q_INVOKABLE int cursorPositionStep(int position, int direction) const;
+    // Rebindable keys. shortcutSequences falls back to the built-in defaults
+    // until setShortcut stores an override; resetShortcut drops it again.
+    // shortcutRows feeds the settings and shortcuts dialogs: one map per
+    // action with its id, description, and sequences joined for display.
+    Q_INVOKABLE QStringList shortcutIds() const;
+    Q_INVOKABLE QString shortcutDescription(const QString &id) const;
+    Q_INVOKABLE QStringList shortcutSequences(const QString &id) const;
+    Q_INVOKABLE QStringList shortcutDefaults(const QString &id) const;
+    Q_INVOKABLE bool setShortcut(const QString &id, const QString &text);
+    Q_INVOKABLE void resetShortcut(const QString &id);
+    Q_INVOKABLE void resetAllShortcuts();
+    Q_INVOKABLE QVariantList shortcutRows() const;
+    double scrollSpeed() const { return m_scrollSpeed; }
+    void setScrollSpeed(double speed);
+    QString treeMode() const { return m_treeMode; }
+    void setTreeMode(const QString &mode);
+    QVariantMap shortcutMap() const;    Q_INVOKABLE int cursorPositionStep(int position, int direction) const;
     Q_INVOKABLE void setSearchHighlight(const QString &query, int currentMatchStart);
     Q_INVOKABLE QVariantList searchMatches(const QString &query) const;
     Q_INVOKABLE void replaceRange(int start, int end, const QString &text);
@@ -115,11 +176,36 @@ signals:
     void saveDialogRequested(const QUrl &suggestedUrl);
     void saveSucceeded();
     void externalChangeDetected(bool deleted, bool locallyModified);
+    void scrollSpeedChanged();
+    void treeModeChanged();
+    void shortcutsChanged();
 
 private:
     friend class OmawriteTest;
 
     void loadDocumentText(const QString &text);
+    void applyHangingIndents(bool clearUndo);
+    QString notesRoot() const;
+    QUrl resolveNote(const QString &target) const;
+    // A note's frontmatter parents and tags, by index-relative path. Read
+    // with the index, so the link tree never re-reads the vault per row.
+    struct NoteMeta {
+        QStringList ups;
+        QStringList tags;
+    };
+    // An up: target resolved against the note that names it, as an
+    // index-relative path. Empty when it names nothing unambiguous.
+    QString resolveUpTarget(const QString &target, const QString &sourceDir) const;
+    static NoteMeta readNoteFrontmatter(const QString &absolutePath);
+    QString attachmentDirectory(bool *vault) const;
+    QString resolveImage(const QString &target, bool wiki) const;
+    // Where an image line's picture is and the size it is drawn at, or an
+    // empty size when the block is not one or its file cannot be read.
+    // natural receives the picture's own size in logical pixels.
+    QSize blockImageSize(const QTextBlock &block, QString *path = nullptr,
+                         QSize *natural = nullptr) const;
+    qreal blockImageMargin(const QTextBlock &block) const;
+    int imagePadding() const;
     qreal steppedTextZoom(int direction) const;
     void setTextZoom(qreal zoom);
     void setFileUrl(const QUrl &url);
@@ -186,6 +272,20 @@ private:
     bool m_autoSaveHeld = false;
     QString m_recoveryPath;
     std::unique_ptr<QLockFile> m_recoveryLock;
+    // Markdown notes beside the open document, cached for [[ suggestions.
+    QString m_notesRoot;
+    QStringList m_notePaths;
+    bool m_notesIndexed = false;
+    QHash<QString, NoteMeta> m_noteMeta;
+    // Wheel-scroll multiplier for the editor and the file viewer, and which
+    // tree the viewer shows. Both persist across windows.
+    double m_scrollSpeed = 2.0;
+    QString m_treeMode = QStringLiteral("links");
+    // Pasted and embedded images: resolved paths by target, pixel sizes by
+    // path, and the widest an image is drawn in the editor.
+    mutable QHash<QString, QString> m_imagePaths;
+    mutable QHash<QString, QSize> m_imageSizes;
+    int m_imageAreaWidth = 0;
 
     QString m_themeBackground;
     QString m_themeForeground;
