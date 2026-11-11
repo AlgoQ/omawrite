@@ -8,10 +8,12 @@ SOURCES += \
     tst_omawrite.cpp \
     ../src/backend.cpp \
     ../src/cli.cpp \
-    ../src/markdownhighlighter.cpp
+    ../src/markdownhighlighter.cpp \
+    ../src/noteoperations.cpp
 HEADERS += \
     ../src/backend.h \
     ../src/cli.h \
-    ../src/markdownhighlighter.h
+    ../src/markdownhighlighter.h \
+    ../src/noteoperations.h
 
 QT += widgets printsupport quickcontrols2 quickdialogs2 dbus

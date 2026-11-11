@@ -28,6 +28,7 @@
 
 #include "backend.h"
 #include "markdownhighlighter.h"
+#include "noteoperations.h"
 
 // Counts QML "Binding loop detected" warnings while it is alive, forwarding
 // everything to the previous handler so test output stays intact.
@@ -480,6 +481,184 @@ private slots:
                      .value(QStringLiteral("line")).toInt(), 1);
     }
 
+    void movesANoteAndRewritesLinksOnBothSides() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("notes")));
+        QVERIFY(root.mkpath(QStringLiteral("archive")));
+        QVERIFY(root.mkpath(QStringLiteral("other")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("notes/Target.md"),
+                      "---\nup:\n  - \"[[notes/Parent]]\"\n---\n"
+                      "# Target\n\nSee [[Child]] and [[notes/Parent#Section|the parent]].\n"));
+        QVERIFY(write(QStringLiteral("notes/Child.md"), "# Child\n"));
+        QVERIFY(write(QStringLiteral("notes/Parent.md"), "# Parent\n"));
+        QVERIFY(write(QStringLiteral("notes/Sibling.md"),
+                      "---\nup:\n  - \"[[notes/Target]]\"\n---\n"
+                      "See [[notes/Target#Heading|Target]] and [[Target|bare]].\n"));
+        // A second Target makes the bare name ambiguous once the first one
+        // leaves notes/, so the links have to name the new folder.
+        QVERIFY(write(QStringLiteral("other/Target.md"), "# Other target\n"));
+        QVERIFY(write(QStringLiteral("archive/Child.md"), "# Another child\n"));
+        QVERIFY(write(QStringLiteral("archive/Parent.md"), "# Another parent\n"));
+
+        NoteOperations operations(root.path(),
+                                  {QStringLiteral("notes/Target.md"),
+                                   QStringLiteral("notes/Child.md"),
+                                   QStringLiteral("notes/Parent.md"),
+                                   QStringLiteral("notes/Sibling.md"),
+                                   QStringLiteral("other/Target.md"),
+                                   QStringLiteral("archive/Child.md"),
+                                   QStringLiteral("archive/Parent.md")});
+        const NoteOperations::Result result =
+            operations.moveNote(root.filePath(QStringLiteral("notes/Target.md")),
+                                root.filePath(QStringLiteral("archive")));
+
+        QVERIFY2(result.success, qPrintable(result.error));
+        QCOMPARE(result.destinationPath,
+                 QDir(root.filePath(QStringLiteral("archive"))).absoluteFilePath(
+                     QStringLiteral("Target.md")));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("notes/Target.md"))));
+        QVERIFY(QFileInfo::exists(result.destinationPath));
+
+        // The link beside the old folder now resolves beside the new one, so
+        // it has to say notes/Child to keep pointing where it did.
+        QVERIFY(readFile(root.filePath(QStringLiteral("archive/Target.md")))
+                    .contains("See [[notes/Child]] and [[notes/Parent#Section|the parent]]."));
+        // Both inbound spellings follow the note, and the alias and heading
+        // stay around the rewritten target.
+        const QByteArray sibling = readFile(root.filePath(QStringLiteral("notes/Sibling.md")));
+        QVERIFY(sibling.contains("  - \"[[archive/Target]]\""));
+        QVERIFY(sibling.contains("[[archive/Target#Heading|Target]]"));
+        QVERIFY(sibling.contains("[[archive/Target|bare]]"));
+        QCOMPARE(result.changedLinks, 4);
+        QCOMPARE(result.warnings, QStringList());
+    }
+
+    void copyLeavesTheSourceAndDuplicatesItsLinks() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("notes")));
+        QVERIFY(root.mkpath(QStringLiteral("archive")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        const QByteArray original =
+            "---\nup:\n  - \"[[notes/Parent]]\"\n---\n"
+            "# Branding\n\nSee [[notes/Child]] and [[Child|kid]].\n";
+        QVERIFY(write(QStringLiteral("notes/Branding.md"), original));
+        QVERIFY(write(QStringLiteral("notes/Child.md"), "# Child\n"));
+        QVERIFY(write(QStringLiteral("notes/Parent.md"), "# Parent\n"));
+
+        NoteOperations operations(root.path(),
+                                  {QStringLiteral("notes/Branding.md"),
+                                   QStringLiteral("notes/Child.md"),
+                                   QStringLiteral("notes/Parent.md")});
+        const NoteOperations::Result result =
+            operations.copyNote(root.filePath(QStringLiteral("notes/Branding.md")),
+                                root.filePath(QStringLiteral("archive")));
+
+        QVERIFY2(result.success, qPrintable(result.error));
+        QCOMPARE(result.destinationPath,
+                 QDir(root.filePath(QStringLiteral("archive"))).absoluteFilePath(
+                     QStringLiteral("Branding.md")));
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("notes/Branding.md"))));
+        QCOMPARE(readFile(root.filePath(QStringLiteral("notes/Branding.md"))), original);
+        // The copy carries its links unchanged: from archive/ the vault paths
+        // still resolve, so nothing had to be rewritten.
+        QCOMPARE(readFile(result.destinationPath), original);
+        QCOMPARE(result.changedLinks, 0);
+    }
+
+    void movesANoteThatIsNotUtf8() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("archive")));
+        const QByteArray latin1("\xff\xfe legacy note\n");
+        writeFile(root.filePath(QStringLiteral("Legacy.md")), latin1);
+
+        NoteOperations operations(root.path(), {QStringLiteral("Legacy.md")});
+        const NoteOperations::Result result =
+            operations.moveNote(root.filePath(QStringLiteral("Legacy.md")),
+                                root.filePath(QStringLiteral("archive")));
+
+        QVERIFY2(result.success, qPrintable(result.error));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("Legacy.md"))));
+        // The bytes survive even though their links could not be read.
+        QCOMPARE(readFile(result.destinationPath), latin1);
+        QCOMPARE(result.warnings.size(), 1);
+    }
+
+    void renamesNotesOnCollision() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("notes")));
+        QVERIFY(root.mkpath(QStringLiteral("archive")));
+        const auto write = [&root](const QString &name, const QByteArray &body) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write(body);
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("notes/Target.md"), "# Target\n"));
+        QVERIFY(write(QStringLiteral("archive/Target.md"), "# Taken\n"));
+        QVERIFY(write(QStringLiteral("notes/Link.md"), "[[notes/Target]]\n"));
+        QVERIFY(write(QStringLiteral("Branding.md"), "# Branding\n"));
+
+        QCOMPARE(NoteOperations::uniqueDestinationPath(
+                     root.filePath(QStringLiteral("archive")), QStringLiteral("Target.md")),
+                 QDir(root.filePath(QStringLiteral("archive"))).absoluteFilePath(
+                     QStringLiteral("Target 1.md")));
+
+        NoteOperations operations(root.path(),
+                                  {QStringLiteral("notes/Target.md"),
+                                   QStringLiteral("notes/Link.md"),
+                                   QStringLiteral("archive/Target.md"),
+                                   QStringLiteral("Branding.md")});
+        const NoteOperations::Result moved =
+            operations.moveNote(root.filePath(QStringLiteral("notes/Target.md")),
+                                root.filePath(QStringLiteral("archive")));
+        QVERIFY2(moved.success, qPrintable(moved.error));
+        QCOMPARE(QFileInfo(moved.destinationPath).fileName(), QStringLiteral("Target 1.md"));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("notes/Target.md"))));
+        // The inbound link names the collision-safe name, not the note that
+        // happened to hold Target.md in archive already.
+        QVERIFY(readFile(root.filePath(QStringLiteral("notes/Link.md")))
+                    .contains("[[Target 1]]"));
+
+        const NoteOperations::Result copied =
+            operations.copyNote(root.filePath(QStringLiteral("Branding.md")),
+                                root.filePath(QStringLiteral("archive")));
+        QVERIFY2(copied.success, qPrintable(copied.error));
+        QCOMPARE(QFileInfo(copied.destinationPath).fileName(), QStringLiteral("Branding.md"));
+        const NoteOperations::Result twice =
+            operations.copyNote(root.filePath(QStringLiteral("Branding.md")),
+                                root.filePath(QStringLiteral("archive")));
+        QVERIFY2(twice.success, qPrintable(twice.error));
+        QCOMPARE(QFileInfo(twice.destinationPath).fileName(), QStringLiteral("Branding 1.md"));
+        QCOMPARE(readFile(root.filePath(QStringLiteral("Branding.md"))),
+                 QByteArray("# Branding\n"));
+    }
+
     void opensLinkedNotesInTabsWithoutDuplicates() {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
@@ -593,6 +772,153 @@ private slots:
         QTest::keyClick(window, Qt::Key_Right, Qt::AltModifier);
         QTRY_COMPARE(backend.fileUrl(), url(QStringLiteral("Second.md")));
         QTRY_VERIFY(forwardButton->property("opacity").toReal() < 0.9);
+    }
+
+    void keepsTabsAndHistoryOnAMovedNotesNewPath() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("filed")));
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("First.md")));
+        QVERIFY(write(QStringLiteral("Second.md")));
+        const auto url = [&root](const QString &name) {
+            return QUrl::fromLocalFile(root.filePath(name));
+        };
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(url(QStringLiteral("First.md")));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("First.md"));
+        QMetaObject::invokeMethod(window, "openInTab", Q_ARG(QVariant, url(QStringLiteral("Second.md"))));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Second.md"));
+        QMetaObject::invokeMethod(window, "openInTab", Q_ARG(QVariant, url(QStringLiteral("First.md"))));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("First.md"));
+        QCOMPARE(window->property("tabs").toList().size(), 2);
+
+        const QVariantMap moved = backend.moveNote(
+            url(QStringLiteral("First.md")).toString(), root.filePath(QStringLiteral("filed")));
+        QVERIFY2(moved.value(QStringLiteral("success")).toBool(),
+                 qPrintable(moved.value(QStringLiteral("error")).toString()));
+        const QUrl movedFirst = QUrl::fromLocalFile(
+            root.filePath(QStringLiteral("filed/First.md")));
+        QCOMPARE(moved.value(QStringLiteral("newUrl")).toUrl(), movedFirst);
+        QTRY_COMPARE(backend.fileUrl(), movedFirst);
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("filed/First.md"))));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("First.md"))));
+
+        // The open note's tab kept its place, the old URL is gone from tabs
+        // and history, and the tab is still the active one.
+        const auto urls = [](const QVariantList &rows) {
+            QStringList list;
+            for (const QVariant &row : rows)
+                list.append(row.toMap().value(QStringLiteral("url")).toString());
+            return list;
+        };
+        const QStringList tabUrls = urls(window->property("tabs").toList());
+        QCOMPARE(tabUrls.size(), 2);
+        QVERIFY(tabUrls.contains(movedFirst.toString()));
+        QVERIFY(!tabUrls.contains(url(QStringLiteral("First.md")).toString()));
+        const int active = window->property("activeTab").toInt();
+        QVERIFY(active >= 0 && active < tabUrls.size());
+        QCOMPARE(tabUrls.at(active), movedFirst.toString());
+
+        const QStringList history = window->property("fileHistory").toStringList();
+        QVERIFY(history.contains(movedFirst.toString()));
+        QVERIFY(!history.contains(url(QStringLiteral("First.md")).toString()));
+
+        // A note open only in a background tab follows its own move too, and
+        // a step back lands on the new path.
+        const QVariantMap secondMoved = backend.moveNote(
+            url(QStringLiteral("Second.md")).toString(), root.filePath(QStringLiteral("filed")));
+        QVERIFY2(secondMoved.value(QStringLiteral("success")).toBool(),
+                 qPrintable(secondMoved.value(QStringLiteral("error")).toString()));
+        const QUrl movedSecond = QUrl::fromLocalFile(
+            root.filePath(QStringLiteral("filed/Second.md")));
+        const QStringList afterSecond = urls(window->property("tabs").toList());
+        QVERIFY(afterSecond.contains(movedSecond.toString()));
+        QVERIFY(!afterSecond.contains(url(QStringLiteral("Second.md")).toString()));
+
+        // A copy leaves the source open where it is and puts the new note
+        // beside it.
+        const QVariantMap copied = backend.copyNote(
+            movedFirst.toString(), root.filePath(QStringLiteral("filed")));
+        QVERIFY2(copied.value(QStringLiteral("success")).toBool(),
+                 qPrintable(copied.value(QStringLiteral("error")).toString()));
+        QCOMPARE(backend.fileUrl(), movedFirst);
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("filed/First 1.md"))));
+
+        QTest::keyClick(window, Qt::Key_Left, Qt::AltModifier);
+        QTRY_COMPARE(backend.fileUrl(), movedSecond);
+    }
+
+    void treeContextMenuMovesANoteToTheSlipbox() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QDir root(dir.path());
+        QVERIFY(root.mkpath(QStringLiteral(".obsidian")));
+        QVERIFY(root.mkpath(QStringLiteral("filed")));
+        const auto write = [&root](const QString &name) {
+            QFile file(root.filePath(name));
+            if (!file.open(QIODevice::WriteOnly))
+                return false;
+            file.write("# note\n");
+            return true;
+        };
+        QVERIFY(write(QStringLiteral("filed/Nested.md")));
+        QVERIFY(write(QStringLiteral("Top.md")));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        backend.open(QUrl::fromLocalFile(root.filePath(QStringLiteral("Top.md"))));
+        QTRY_COMPARE(backend.fileName(), QStringLiteral("Top.md"));
+        QTest::keyClick(window, Qt::Key_O, Qt::ControlModifier);
+        QObject *list = window->findChild<QObject *>(QStringLiteral("fileViewerList"));
+        QVERIFY(list);
+        QTRY_COMPARE(list->property("count").toInt(), 2);
+
+        // Links mode orders the roots by name: Nested (file:///.../filed)
+        // then Top. Right-clicking Nested offers the slipbox root.
+        QVERIFY(QMetaObject::invokeMethod(window, "showTreeContextMenu", Q_ARG(QVariant, 0)));
+        QObject *menu = window->findChild<QObject *>(QStringLiteral("noteContextMenu"));
+        QVERIFY(menu);
+        QTRY_VERIFY(menu->property("opened").toBool());
+
+        QObject *moveItem = window->findChild<QObject *>(QStringLiteral("noteMenuMoveSlipbox"));
+        QVERIFY(moveItem);
+        QVERIFY(QMetaObject::invokeMethod(moveItem, "triggered"));
+        QTRY_VERIFY(QFileInfo::exists(root.filePath(QStringLiteral("Nested.md"))));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("filed/Nested.md"))));
+        QMetaObject::invokeMethod(menu, "close");
     }
 
     void showsAFileViewerOfTheSlipbox() {
