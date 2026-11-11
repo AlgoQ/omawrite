@@ -119,6 +119,14 @@ click any other value to edit it in place. `+ Add property` appends a key and
 comments, key order, and properties this panel does not understand untouched.
 The `⌄` in the heading folds the block away.
 
+## Tables
+
+A GitHub-style pipe table is drawn as a table while the caret is elsewhere:
+header row, body rows, the alignment its delimiter row asks for, and cells that
+wrap with the writing column. Move the caret into the table and its raw
+Markdown comes back for editing; leave it and the table returns. A table inside
+a code fence stays code.
+
 ## Requirements
 
 - Qt 6: `qt6-base` and `qt6-declarative` (which includes Qt Quick Controls)

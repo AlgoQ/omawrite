@@ -24,9 +24,11 @@
 #include <QStandardPaths>
 #include <QClipboard>
 #include <QMimeData>
+#include <functional>
 #include "cli.h"
 
 #include "backend.h"
+#include "blockrenderer.h"
 #include "markdownhighlighter.h"
 #include "noteindex.h"
 #include "vault.h"
@@ -151,6 +153,147 @@ private slots:
         QVERIFY(!embed(QStringLiteral("![](page.html)")).isValid());
         QVERIFY(MarkdownHighlighter::isImageFileName(QStringLiteral("PIC.JPEG")));
         QVERIFY(!MarkdownHighlighter::isImageFileName(QStringLiteral("note.md")));
+    }
+
+    void findsPipeTables() {
+        QTextDocument document;
+        document.setPlainText(QStringLiteral(
+            "Intro\n"
+            "\n"
+            "| Item | Qty | Price |\n"
+            "| :--- | :---: | ---: |\n"
+            "| Tea | 2 | 3.50 |\n"
+            "| Coffee |  | 4.00 |\n"
+            "\n"
+            "After\n"));
+        const QList<BlockRenderer::Table> tables = BlockRenderer::tables(&document);
+        QCOMPARE(tables.size(), 1);
+        const BlockRenderer::Table &table = tables.constFirst();
+        QVERIFY(table.isValid());
+        QCOMPARE(table.firstBlock, 2);
+        QCOMPARE(table.lastBlock, 5);
+        QCOMPARE(table.blockStart, document.findBlockByNumber(2).position());
+        QCOMPARE(table.blockEnd,
+                 document.findBlockByNumber(5).position()
+                     + document.findBlockByNumber(5).text().length());
+        QCOMPARE(table.rows.size(), 3);
+        QCOMPARE(table.rows.at(0),
+                 (QStringList{QStringLiteral("Item"), QStringLiteral("Qty"),
+                              QStringLiteral("Price")}));
+        QCOMPARE(table.rows.at(1),
+                 (QStringList{QStringLiteral("Tea"), QStringLiteral("2"),
+                              QStringLiteral("3.50")}));
+        // An empty middle cell stays a cell rather than collapsing the row.
+        QCOMPARE(table.rows.at(2).size(), 3);
+        QCOMPARE(table.rows.at(2).at(1), QString());
+        QCOMPARE(int(table.alignments.at(0)), int(BlockRenderer::Alignment::Left));
+        QCOMPARE(int(table.alignments.at(1)), int(BlockRenderer::Alignment::Center));
+        QCOMPARE(int(table.alignments.at(2)), int(BlockRenderer::Alignment::Right));
+
+        // The block test the highlighter and Backend use finds the table from
+        // any of its lines, and leaves prose alone.
+        QCOMPARE(BlockRenderer::tableAtBlock(&document,
+                                             document.findBlockByNumber(4)).rows.size(), 3);
+        QCOMPARE(BlockRenderer::tableAtBlock(&document,
+                                             document.findBlockByNumber(3)).firstBlock, 2);
+        QVERIFY(!BlockRenderer::tableAtBlock(&document,
+                                             document.findBlockByNumber(0)).isValid());
+
+        // Geometry is measured against the writing column: the columns fill
+        // it and every row has a height, which is what the overlay draws.
+        const QList<BlockRenderer::Table> measured =
+            BlockRenderer::tables(&document, 400, document.defaultFont());
+        QCOMPARE(measured.size(), 1);
+        int columnTotal = 0;
+        for (const int width : measured.constFirst().columnWidths)
+            columnTotal += width;
+        QCOMPARE(columnTotal, 400);
+        QCOMPARE(measured.constFirst().rowHeights.size(),
+                 measured.constFirst().rows.size());
+        QVERIFY(measured.constFirst().height > 0);
+
+        // GFM does not require the leading or trailing pipe.
+        QTextDocument bare;
+        bare.setPlainText(QStringLiteral("Name | Age\n"
+                                         "--- | ---\n"
+                                         "Ada | 36\n"));
+        const QList<BlockRenderer::Table> bareTables = BlockRenderer::tables(&bare);
+        QCOMPARE(bareTables.size(), 1);
+        QCOMPARE(bareTables.constFirst().rows.at(0),
+                 (QStringList{QStringLiteral("Name"), QStringLiteral("Age")}));
+        QCOMPARE(bareTables.constFirst().rows.at(1),
+                 (QStringList{QStringLiteral("Ada"), QStringLiteral("36")}));
+
+        // A table inside a fence is code, not a table.
+        QTextDocument fenced;
+        fenced.setPlainText(QStringLiteral("```\n"
+                                           "| a | b |\n"
+                                           "| --- | --- |\n"
+                                           "```\n"));
+        QCOMPARE(BlockRenderer::tables(&fenced).size(), 0);
+
+        // Escaped pipes are text, and a pipe in a code span does not split.
+        QTextDocument escaped;
+        escaped.setPlainText(QStringLiteral("| a\\|b | ``c|d`` |\n"
+                                            "| --- | --- |\n"
+                                            "| 1 | 2 |\n"));
+        const QList<BlockRenderer::Table> escapedTables = BlockRenderer::tables(&escaped);
+        QCOMPARE(escapedTables.size(), 1);
+        QCOMPARE(escapedTables.constFirst().rows.at(0),
+                 (QStringList{QStringLiteral("a|b"), QStringLiteral("``c|d``")}));
+
+        // The delimiter row has to name one column per header cell.
+        QTextDocument mismatched;
+        mismatched.setPlainText(QStringLiteral("| a | b |\n"
+                                               "| --- |\n"
+                                               "| 1 | 2 |\n"));
+        QCOMPARE(BlockRenderer::tables(&mismatched).size(), 0);
+
+        // A rule between two paragraphs is not a one-column table either.
+        QTextDocument rule;
+        rule.setPlainText(QStringLiteral("above\n"
+                                         "---\n"
+                                         "below\n"));
+        QCOMPARE(BlockRenderer::tables(&rule).size(), 0);
+    }
+
+    void hidesTableSourceAwayFromTheCaret() {
+        QTextDocument document;
+        document.setPlainText(QStringLiteral(
+            "Intro\n"
+            "\n"
+            "| a | b |\n"
+            "| --- | --- |\n"
+            "| 1 | 2 |\n"));
+        MarkdownHighlighter highlighter(&document);
+        highlighter.setTheme(true, "#101010", "#eeeeee", "#5584aa", "#23372b");
+        highlighter.setCaret(0);
+        highlighter.rehighlight();
+
+        const auto hiddenLength = [&document](int blockNumber) {
+            int hidden = 0;
+            const QTextBlock block = document.findBlockByNumber(blockNumber);
+            for (const auto &range : block.layout()->formats()) {
+                if (range.format.foreground().color().alpha() == 0)
+                    hidden += range.length;
+            }
+            return hidden;
+        };
+
+        // Away from the table its three source lines are invisible.
+        for (int blockNumber = 2; blockNumber <= 4; ++blockNumber)
+            QVERIFY(hiddenLength(blockNumber) > 0);
+
+        // The caret anywhere in the table brings every raw line back.
+        const int headerPosition = document.findBlockByNumber(2).position();
+        highlighter.setCaret(headerPosition + 2);
+        for (int blockNumber = 2; blockNumber <= 4; ++blockNumber)
+            QCOMPARE(hiddenLength(blockNumber), 0);
+
+        // Leaving it hides them again.
+        highlighter.setCaret(0);
+        for (int blockNumber = 2; blockNumber <= 4; ++blockNumber)
+            QVERIFY(hiddenLength(blockNumber) > 0);
     }
 
     void searchIgnoresDiacriticsTheQueryLeavesOut() {
@@ -1729,6 +1872,118 @@ private slots:
         QTRY_VERIFY(editor->property("activeFocus").toBool());
         QCOMPARE(editor->property("cursorPosition").toInt(),
                  embeds.first().toMap().value(QStringLiteral("blockEnd")).toInt());
+    }
+
+    void showsTablesAwayFromTheCaret() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString notePath = QDir(dir.path()).filePath(QStringLiteral("Table.md"));
+        writeFile(notePath, QByteArrayLiteral(
+            "# Note\n"
+            "\n"
+            "| Name | Value |\n"
+            "| :--- | ---: |\n"
+            "| Alpha | 1 |\n"
+            "| Beta | 2 |\n"
+            "| Gamma | 3 |\n"
+            "| Delta | 4 |\n"
+            "| Epsilon | 5 |\n"
+            "| Zeta | 6 |\n"
+            "| Eta | 7 |\n"
+            "| Theta | 8 |\n"
+            "\n"
+            "After the table.\n"));
+
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *editorItem = qobject_cast<QQuickItem *>(editor);
+        QVERIFY(editorItem);
+        backend.open(QUrl::fromLocalFile(notePath));
+
+        // QML items created by a Repeater are parented to their item tree, not
+        // to the window's QObject tree, so walk the editor's children.
+        const auto findOverlays = [editorItem]() {
+            QList<QQuickItem *> found;
+            for (QQuickItem *child : editorItem->childItems()) {
+                if (child->objectName() == QStringLiteral("tableOverlay"))
+                    found.append(child);
+            }
+            return found;
+        };
+        std::function<int(QQuickItem *)> countRows;
+        countRows = [&countRows](QQuickItem *item) {
+            int rows = 0;
+            for (QQuickItem *child : item->childItems()) {
+                if (child->objectName() == QStringLiteral("tableOverlayRow"))
+                    ++rows;
+                rows += countRows(child);
+            }
+            return rows;
+        };
+
+        QTRY_COMPARE(findOverlays().size(), 1);
+        QQuickItem *overlay = findOverlays().constFirst();
+        QTRY_COMPARE(countRows(overlay), 9);
+
+        auto *quickDocument = qobject_cast<QQuickTextDocument *>(
+            editor->property("textDocument").value<QObject *>());
+        QVERIFY(quickDocument);
+        const auto hiddenLength = [&](int blockNumber) {
+            int hidden = 0;
+            const QTextBlock block = quickDocument->textDocument()->findBlockByNumber(blockNumber);
+            for (const auto &range : block.layout()->formats()) {
+                if (range.format.foreground().color().alpha() == 0)
+                    hidden += range.length;
+            }
+            return hidden;
+        };
+
+        // Away from the table the raw pipe lines are hidden and the drawn
+        // table takes their place.
+        editor->setProperty("cursorPosition", 0);
+        QTRY_VERIFY(overlay->isVisible());
+        QVERIFY(overlay->height() > 0);
+        for (int blockNumber = 2; blockNumber <= 10; ++blockNumber)
+            QTRY_VERIFY2(hiddenLength(blockNumber) > 0, qPrintable(QString::number(blockNumber)));
+
+        // The caret anywhere in the table brings the raw Markdown back and
+        // hides the overlay, including its rows.
+        const int headerPosition =
+            quickDocument->textDocument()->findBlockByNumber(2).position();
+        editor->setProperty("cursorPosition", headerPosition + 2);
+        QTRY_VERIFY(!overlay->isVisible());
+        for (int blockNumber = 2; blockNumber <= 10; ++blockNumber)
+            QTRY_COMPARE(hiddenLength(blockNumber), 0);
+
+        // Leaving the table renders it again.
+        editor->setProperty("cursorPosition", editor->property("text").toString().length());
+        QTRY_VERIFY(overlay->isVisible());
+        QTRY_VERIFY(hiddenLength(2) > 0);
+
+        // A table that dissolves becomes plain prose again, with its hidden
+        // lines cleared, and a table typed from scratch joins the overlay.
+        editor->setProperty("text", QStringLiteral("| a | b |\nnot a delimiter\n"));
+        QTRY_COMPARE(findOverlays().size(), 0);
+        QTRY_COMPARE(hiddenLength(0), 0);
+        QTRY_COMPARE(hiddenLength(1), 0);
+
+        editor->setProperty("text", QStringLiteral("| a | b |\n| --- | --- |\n| 1 | 2 |\n"));
+        editor->setProperty("cursorPosition", editor->property("text").toString().length());
+        QTRY_COMPARE(findOverlays().size(), 1);
+        QTRY_VERIFY(findOverlays().constFirst()->isVisible());
     }
 
     void searchFollowsEditsWithoutTakingTheCaret() {

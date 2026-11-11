@@ -6,6 +6,7 @@ TEMPLATE = app
 
 HEADERS += \
     src/backend.h \
+    src/blockrenderer.h \
     src/cli.h \
     src/markdownhighlighter.h \
     src/noteindex.h \
@@ -15,6 +16,7 @@ HEADERS += \
 SOURCES += \
     src/main.cpp \
     src/backend.cpp \
+    src/blockrenderer.cpp \
     src/cli.cpp \
     src/markdownhighlighter.cpp \
     src/noteindex.cpp \

@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "markdownhighlighter.h"
+#include "blockrenderer.h"
 
 constexpr qreal typoraLineHeightPercent = 140;
 
@@ -56,6 +57,25 @@ static QTextBlockFormat lineHeightFormat() {
     QTextBlockFormat format;
     format.setLineHeight(typoraLineHeightPercent, QTextBlockFormat::ProportionalHeight);
     return format;
+}
+
+// A rendered table hides its source lines in place, so they keep their own
+// line heights. The bottom margin covers only the room the drawn table needs
+// beyond them; that is what keeps the text below still when the caret enters
+// the table and the raw Markdown comes back.
+static QHash<int, qreal> renderedBlockMargins(const QList<BlockRenderer::Table> &tables,
+                                              const QFont &font) {
+    QHash<int, qreal> margins;
+    const qreal lineHeight =
+        QFontMetricsF(font).height() * typoraLineHeightPercent / 100.0;
+    for (const BlockRenderer::Table &table : tables) {
+        if (!table.isValid())
+            continue;
+        const int sourceLines = table.lastBlock - table.firstBlock + 1;
+        margins.insert(table.lastBlock,
+                       qMax(0.0, table.height - sourceLines * lineHeight));
+    }
+    return margins;
 }
 
 // A list item's wrapped lines belong under its text, not under the marker or
@@ -1863,6 +1883,16 @@ int Backend::imagePadding() const {
     return qRound(QFontMetricsF(m_document->defaultFont()).height() * 0.3);
 }
 
+int Backend::blockAreaWidth() const {
+    if (m_tableAreaWidth > 0)
+        return m_tableAreaWidth;
+    if (m_document && m_document->textWidth() > 0)
+        return qRound(m_document->textWidth());
+    if (m_imageAreaWidth > 0)
+        return m_imageAreaWidth;
+    return 600;
+}
+
 QSize Backend::blockImageSize(const QTextBlock &block, QString *path, QSize *natural) const {
     if (!block.isValid() || block.userState() >= MarkdownHighlighter::InsideFence
             || block.previous().userState() >= MarkdownHighlighter::InsideFence)
@@ -1962,6 +1992,57 @@ void Backend::setImageAreaWidth(int width) {
     if (width == m_imageAreaWidth)
         return;
     m_imageAreaWidth = width;
+    applyHangingIndents(false);
+}
+
+// The editor's rendered-block overlays in document order. Tables are the only
+// kind for now; the map's "kind" is the seam a heading or task overlay reads.
+QVariantList Backend::renderedBlocks() const {
+    QVariantList blocks;
+    if (!m_document)
+        return blocks;
+
+    const int areaWidth = blockAreaWidth();
+    const QFont font = m_document->defaultFont();
+    for (const BlockRenderer::Table &table : BlockRenderer::tables(m_document, areaWidth, font)) {
+        QVariantList rows;
+        for (int row = 0; row < table.rows.size(); ++row) {
+            QVariantList cells;
+            for (const QString &cell : table.rows.at(row))
+                cells.append(cell);
+            rows.append(QVariantMap{
+                {QStringLiteral("cells"), cells},
+                {QStringLiteral("height"), table.rowHeights.value(row)},
+                {QStringLiteral("header"), row == 0}});
+        }
+
+        QVariantList widths;
+        for (const int width : table.columnWidths)
+            widths.append(width);
+        QVariantList alignments;
+        for (const BlockRenderer::Alignment alignment : table.alignments)
+            alignments.append(BlockRenderer::alignmentName(alignment));
+
+        blocks.append(QVariantMap{
+            {QStringLiteral("kind"), QStringLiteral("table")},
+            {QStringLiteral("blockStart"), table.blockStart},
+            {QStringLiteral("blockEnd"), table.blockEnd},
+            {QStringLiteral("width"), areaWidth},
+            {QStringLiteral("height"), table.height},
+            {QStringLiteral("cellPadding"), table.cellPadding},
+            {QStringLiteral("columnWidths"), widths},
+            {QStringLiteral("alignments"), alignments},
+            {QStringLiteral("rows"), rows}});
+    }
+    return blocks;
+}
+
+// The writing column's width for rendered blocks. Geometry and the reserved
+// space below each block both come from it, so a resize measures both again.
+void Backend::setTableAreaWidth(int width) {
+    if (width == m_tableAreaWidth)
+        return;
+    m_tableAreaWidth = width;
     applyHangingIndents(false);
 }
 
@@ -2722,9 +2803,16 @@ void Backend::applyHangingIndents(bool clearUndo) {
 
     const QFontMetricsF metrics(m_document->defaultFont());
     const QFont font = m_document->defaultFont();
-    const auto wantedFormat = [this, &metrics, &font](const QTextBlock &block) {
+    const QList<BlockRenderer::Table> tables =
+        BlockRenderer::tables(m_document, blockAreaWidth(), font);
+    const QHash<int, qreal> tableMargins = renderedBlockMargins(tables, font);
+    m_tableBlockRanges.clear();
+    for (const BlockRenderer::Table &table : tables)
+        m_tableBlockRanges.append({table.firstBlock, table.lastBlock});
+    const auto wantedFormat = [this, &metrics, &font, &tableMargins](const QTextBlock &block) {
         QTextBlockFormat format = hangingIndentFormat(block.text(), metrics, font);
-        format.setBottomMargin(blockImageMargin(block));
+        format.setBottomMargin(qMax(blockImageMargin(block),
+                                    tableMargins.value(block.blockNumber(), 0.0)));
         return format;
     };
     QList<QTextBlock> changed;
@@ -2780,21 +2868,77 @@ void Backend::reapplyTypographyToChange() {
 
     const QFontMetricsF metrics(m_document->defaultFont());
     const QFont font = m_document->defaultFont();
-    const auto wantedFormat = [this, &metrics, &font](const QTextBlock &block) {
+    const QTextBlock startBlock = m_document->findBlock(start);
+    const QTextBlock endBlock = m_document->findBlock(end);
+    if (!startBlock.isValid())
+        return;
+
+    // A table's geometry is reserved on its last line, and its source lines
+    // restyle as one block, so the pass covers a couple of lines around the
+    // edit (a delimiter row can form or dissolve a table) plus any table that
+    // touches them. Old table ranges are included too, so a table that just
+    // dissolved has its margins and hidden lines cleared.
+    int firstNumber = qMax(0, startBlock.blockNumber() - 2);
+    int lastNumber = (endBlock.isValid() ? endBlock.blockNumber() : startBlock.blockNumber()) + 2;
+    const int changedFirst = firstNumber;
+    const int changedLast = lastNumber;
+    const auto touchesChange = [changedFirst, changedLast](int first, int last) {
+        return last >= changedFirst && first <= changedLast;
+    };
+
+    QList<BlockRenderer::Table> tables;
+    const auto includeTable = [&](const BlockRenderer::Table &table) {
+        if (!table.isValid())
+            return;
+        tables.append(table);
+        firstNumber = qMin(firstNumber, table.firstBlock);
+        lastNumber = qMax(lastNumber, table.lastBlock);
+    };
+
+    const QList<BlockRenderer::Table> currentTables =
+        BlockRenderer::tables(m_document, blockAreaWidth(), font);
+    for (const QPair<int, int> &range : m_tableBlockRanges) {
+        if (touchesChange(range.first, range.second)) {
+            firstNumber = qMin(firstNumber, range.first);
+            lastNumber = qMax(lastNumber, range.second);
+        }
+    }
+    for (const BlockRenderer::Table &table : currentTables) {
+        if (touchesChange(table.firstBlock, table.lastBlock))
+            includeTable(table);
+    }
+
+    const QHash<int, qreal> tableMargins = renderedBlockMargins(tables, font);
+    const auto wantedFormat = [this, &metrics, &font, &tableMargins](const QTextBlock &block) {
         const QTextBlockFormat indent = hangingIndentFormat(block.text(), metrics, font);
         QTextBlockFormat format = lineHeightFormat();
         format.setIndent(indent.indent());
         format.setTextIndent(indent.textIndent());
-        format.setBottomMargin(blockImageMargin(block));
+        format.setBottomMargin(qMax(blockImageMargin(block),
+                                    tableMargins.value(block.blockNumber(), 0.0)));
         return format;
     };
 
     // Blocks that already have it are left alone: an undo brings their format
     // back with the text, and merging anyway would push a command that clears
-    // the redo stack.
+    // the redo stack. A table appearing or disappearing changes styles even
+    // when no block format moved, so remember whether it did.
+    bool tablesChanged = m_tableBlockRanges.size() != currentTables.size();
+    if (!tablesChanged) {
+        for (int i = 0; i < currentTables.size(); ++i) {
+            if (m_tableBlockRanges.at(i).first != currentTables.at(i).firstBlock
+                    || m_tableBlockRanges.at(i).second != currentTables.at(i).lastBlock) {
+                tablesChanged = true;
+                break;
+            }
+        }
+    }
+
     bool needed = false;
-    for (QTextBlock block = m_document->findBlock(start);
-         block.isValid() && block.position() <= end; block = block.next()) {
+    for (int number = firstNumber; number <= lastNumber; ++number) {
+        const QTextBlock block = m_document->findBlockByNumber(number);
+        if (!block.isValid())
+            break;
         const QTextBlockFormat current = block.blockFormat();
         const QTextBlockFormat wanted = wantedFormat(block);
         if (current.lineHeightType() != wanted.lineHeightType()
@@ -2806,22 +2950,33 @@ void Backend::reapplyTypographyToChange() {
             break;
         }
     }
-    if (!needed)
+    if (!needed && !tablesChanged)
         return;
 
-    m_formattingTypography = true;
-    QTextCursor cursor(m_document);
-    cursor.joinPreviousEditBlock();
-    for (QTextBlock block = m_document->findBlock(start);
-         block.isValid() && block.position() <= end; block = block.next()) {
-        cursor.setPosition(block.position());
-        cursor.mergeBlockFormat(wantedFormat(block));
+    if (needed) {
+        m_formattingTypography = true;
+        QTextCursor cursor(m_document);
+        cursor.joinPreviousEditBlock();
+        for (int number = firstNumber; number <= lastNumber; ++number) {
+            const QTextBlock block = m_document->findBlockByNumber(number);
+            if (!block.isValid())
+                break;
+            cursor.setPosition(block.position());
+            cursor.mergeBlockFormat(wantedFormat(block));
+        }
+        cursor.endEditBlock();
     }
-    cursor.endEditBlock();
     if (m_highlighter) {
-        for (QTextBlock block = m_document->findBlock(start);
-             block.isValid() && block.position() <= end; block = block.next())
+        for (int number = firstNumber; number <= lastNumber; ++number) {
+            const QTextBlock block = m_document->findBlockByNumber(number);
+            if (!block.isValid())
+                break;
             m_highlighter->rehighlightBlock(block);
+        }
+        m_highlighter->refreshTables();
     }
     m_formattingTypography = false;
+    m_tableBlockRanges.clear();
+    for (const BlockRenderer::Table &table : currentTables)
+        m_tableBlockRanges.append({table.firstBlock, table.lastBlock});
 }

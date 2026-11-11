@@ -96,6 +96,7 @@ void MarkdownHighlighter::rehighlightAll() {
 
 void MarkdownHighlighter::setCaret(int position) {
     const QTextBlock left = m_caret.isNull() ? QTextBlock() : m_caret.block();
+    const BlockRenderer::Table leftTable = tableForBlock(left);
     if (m_caret.isNull()) {
         m_caret = QTextCursor(document());
         // Loading a file inserts at the caret, which must not drag it along
@@ -105,10 +106,70 @@ void MarkdownHighlighter::setCaret(int position) {
     m_caret.setPosition(qBound(0, position, document()->characterCount() - 1));
 
     // Only the lines the caret left and entered can show different markers.
+    // A table is one block in the rendered view, though, so entering or
+    // leaving it restyles every source line at once.
     const QTextBlock entered = m_caret.block();
-    if (left.isValid() && left != entered)
+    const BlockRenderer::Table enteredTable = tableForBlock(entered);
+    if (leftTable.isValid() && enteredTable.isValid()
+            && leftTable.firstBlock == enteredTable.firstBlock) {
+        if (left.isValid() && left != entered)
+            rehighlightBlock(left);
+        rehighlightBlock(entered);
+        return;
+    }
+    if (leftTable.isValid())
+        rehighlightTable(leftTable);
+    else if (left.isValid() && left != entered)
         rehighlightBlock(left);
-    rehighlightBlock(entered);
+    if (enteredTable.isValid())
+        rehighlightTable(enteredTable);
+    else
+        rehighlightBlock(entered);
+}
+
+// Parses rendered blocks again after an edit. A table can form when its
+// delimiter row is typed and dissolve when it is changed, so both the lines
+// that were part of a table and the ones that are now need a fresh style.
+void MarkdownHighlighter::refreshTables() {
+    m_tablesRevision = -1;
+    const QList<BlockRenderer::Table> current = tables();
+    for (const BlockRenderer::Table &table : current) {
+        for (int number = table.firstBlock - 1; number <= table.lastBlock + 1; ++number) {
+            const QTextBlock block = document()->findBlockByNumber(number);
+            if (block.isValid())
+                rehighlightBlock(block);
+        }
+    }
+}
+
+const QList<BlockRenderer::Table> &MarkdownHighlighter::tables() {
+    QTextDocument *doc = document();
+    const int revision = doc ? doc->revision() : -1;
+    if (revision != m_tablesRevision) {
+        m_tables = doc ? BlockRenderer::tables(doc) : QList<BlockRenderer::Table>();
+        m_tablesRevision = revision;
+    }
+    return m_tables;
+}
+
+BlockRenderer::Table MarkdownHighlighter::tableForBlock(const QTextBlock &block) {
+    if (!block.isValid())
+        return {};
+    for (const BlockRenderer::Table &table : tables()) {
+        if (table.containsBlock(block.blockNumber()))
+            return table;
+    }
+    return {};
+}
+
+void MarkdownHighlighter::rehighlightTable(const BlockRenderer::Table &table) {
+    if (!table.isValid() || !document())
+        return;
+    for (int number = table.firstBlock; number <= table.lastBlock; ++number) {
+        const QTextBlock block = document()->findBlockByNumber(number);
+        if (block.isValid())
+            rehighlightBlock(block);
+    }
 }
 
 void MarkdownHighlighter::rebuildFormats() {
@@ -132,6 +193,12 @@ void MarkdownHighlighter::rebuildFormats() {
     m_hiddenMarkerFormat = QTextCharFormat();
     m_hiddenMarkerFormat.setForeground(background);
     m_hiddenMarkerFormat.setFontPointSize(1.0);
+
+    // A rendered block's source occupies the room the block is drawn over.
+    // Transparent text hides it without shrinking its lines, so the page does
+    // not reflow when the caret enters the block and the source comes back.
+    m_hiddenLineFormat = QTextCharFormat();
+    m_hiddenLineFormat.setForeground(Qt::transparent);
 
     QFont hiddenFont = document() ? document()->defaultFont() : QFont();
     hiddenFont.setPointSizeF(1.0);
@@ -212,6 +279,18 @@ void MarkdownHighlighter::highlightBlock(const QString &text) {
         return;
     }
     setCurrentBlockState(Prose);
+
+    // A table is drawn as a table while the caret is elsewhere, so its source
+    // lines step aside; while the caret is anywhere in it, the raw Markdown
+    // shows and the overlay hides. Images below keep their single-line rule.
+    const BlockRenderer::Table table = tableForBlock(currentBlock());
+    if (table.isValid()) {
+        const int caretBlock = m_caret.isNull() ? -1 : m_caret.block().blockNumber();
+        if (caretBlock < table.firstBlock || caretBlock > table.lastBlock) {
+            setFormat(0, text.length(), m_hiddenLineFormat);
+            return;
+        }
+    }
 
     // Backend reserves room below a line whose image it found, and the editor
     // draws the image there; the line's own text steps aside until the caret
